@@ -1,0 +1,150 @@
+name: Verify native releases
+
+on:
+  push:
+    paths-ignore:
+      - "web/**"
+      - "docs/**"
+      - "*.md"
+      - "LICENSE"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x86_64
+          - os: windows-2025
+            target: windows-x86_64
+    env:
+      BUILD_TARGET: ${{ matrix.target }}
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      OPENAI_API_KEY: ""
+      CODEX_API_KEY: ""
+      CODEX_ACCESS_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: companion/voice_bridge/requirements.txt
+
+      - name: Install audio test dependencies
+        run: python -m pip install -r companion/voice_bridge/requirements.txt
+
+      - name: Prepare isolated account and verified Godot runtime
+        shell: python {0}
+        run: |
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd()))
+          from tools.runtime import godot_runtime
+          root = Path(os.environ["RUNNER_TEMP"]) / "shadow-aim-ci"
+          (root / "empty-codex").mkdir(parents=True, exist_ok=True)
+          engine = godot_runtime(Path("build/runtime-cache"), os.environ["BUILD_TARGET"]).resolve()
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+              out.write(f"CODEX_HOME={root / 'empty-codex'}\n")
+              out.write(f"AIMCOACH_CI_ROOT={root}\n")
+              out.write(f"AIMCOACH_DATA_DIR={root / 'data'}\n")
+              out.write(f"AIMCOACH_STATE_DIR={root / 'logs'}\n")
+              out.write(f"GODOT_BIN={engine}\n")
+
+      - name: Unit and protocol tests without account calls
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Export failure classification
+        run: python -m unittest tools.test_package -v
+      - name: Full-duplex protocol fixtures
+        run: python -m unittest companion.voice_bridge.test_bridge -v
+
+      - name: Native gameplay and interface smoke checks
+        shell: python {0}
+        run: |
+          import os, subprocess, sys
+          from pathlib import Path
+          scripts = ["arena_smoke", "ui_smoke", "ui_workflows_smoke", "pause_smoke",
+                     "sensitivity_result_smoke", "account_panel_smoke", "music_ui_smoke", "voice_audio_smoke",
+                     "audio_controls_smoke", "reactive_tracking_smoke"]
+          # full_loop_smoke deliberately excluded: it performs live subscription inference.
+          for script in scripts:
+              root = Path(os.environ["AIMCOACH_CI_ROOT"]) / script
+              env = {**os.environ, "AIMCOACH_DATA_DIR": str(root / "data"),
+                     "AIMCOACH_STATE_DIR": str(root / "logs"), "XDG_DATA_HOME": str(root / "xdg"),
+                     "APPDATA": str(root / "roaming"), "LOCALAPPDATA": str(root / "local")}
+              result = subprocess.run([sys.executable, "launch.py", "--headless", "--audio-driver", "Dummy",
+                                       "--script", f"res://tests/{script}.gd"], env=env, timeout=45)
+              log = root / "logs/game.log"
+              output = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+              print(f"{script}:\n{output}")
+              if result.returncode or any(message in output for message in ("SCRIPT ERROR:", "Parse Error:", "Assertion failed")):
+                  raise SystemExit(f"Native check failed: {script}")
+
+      - name: Build release bundle
+        shell: python {0}
+        run: |
+          import os, subprocess, sys
+          subprocess.run([sys.executable, "tools/package.py", "--release", "--target",
+                          os.environ["BUILD_TARGET"], "--godot", os.environ["GODOT_BIN"]], check=True)
+
+      - name: Run extracted release with its bundled native runtime
+        shell: python {0}
+        run: |
+          import os, shutil, subprocess, sys
+          from pathlib import Path
+          target = os.environ["BUILD_TARGET"]
+          suffix = ".zip" if target.startswith("windows") else ".tar.gz"
+          root = Path(os.environ["AIMCOACH_CI_ROOT"]) / "release smoke"
+          root.mkdir(parents=True, exist_ok=True)
+          shutil.unpack_archive(str(Path("build") / f"shadow-aim-{target}{suffix}"), root)
+          bundle = root / "shadow-aim"
+          python = bundle / "runtime/python/python.exe" if target.startswith("windows") else Path(sys.executable)
+          env = {**os.environ, "AIMCOACH_DATA_DIR": str(root / "data"),
+                 "AIMCOACH_STATE_DIR": str(root / "logs"), "XDG_DATA_HOME": str(root / "xdg"),
+                 "APPDATA": str(root / "roaming"), "LOCALAPPDATA": str(root / "local")}
+          env.pop("GODOT_BIN", None)
+          env.pop("AIMCOACH_RUNTIME_ACTIVE", None)
+          if target.startswith("windows"):
+              # The distributed archive contains no third-party codec wheels.
+              # Verify the same pinned, app-local audio setup used after extraction.
+              subprocess.run([str(python), str(bundle / "tools/setup.py"), "--audio"],
+                             cwd=bundle, env=env, timeout=300, check=True)
+              subprocess.run([str(python), "-c", "from companion.voice_bridge import _load_media; _load_media()"],
+                             cwd=bundle, env=env, timeout=30, check=True)
+          result = subprocess.run([str(python), str(bundle / "launch.py"), "--headless", "--audio-driver",
+                                   "Dummy", "--quit-after", "30"], cwd=root, env=env, timeout=45)
+          log = root / "logs/game.log"
+          output = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+          print(output)
+          if result.returncode or not log.exists() or any(text in output for text in ("SCRIPT ERROR:", "Parse Error:", "Failed to load")):
+              raise SystemExit("Extracted release smoke failed")
+
+      - name: Upload tested release
+        uses: actions/upload-artifact@v7
+        with:
+          name: shadow-aim-${{ matrix.target }}
+          path: build/shadow-aim-${{ matrix.target }}.*
+          if-no-files-found: error
+          compression-level: 0
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ matrix.target }}
+          path: ${{ runner.temp }}/shadow-aim-ci/**/logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7

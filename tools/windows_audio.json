@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "python": "3.12",
+  "platform": "win_amd64",
+  "wheels": [
+    {
+      "package": "aioice",
+      "version": "0.10.2",
+      "filename": "aioice-0.10.2-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/c7/e3/0d23b1f930c17d371ce1ec36ee529f22fd19ebc2a07fe3418e3d1d884ce2/aioice-0.10.2-py3-none-any.whl",
+      "sha256": "14911c15ab12d096dd14d372ebb4aecbb7420b52c9b76fdfcf54375dec17fcbf"
+    },
+    {
+      "package": "aiortc",
+      "version": "1.15.0",
+      "filename": "aiortc-1.15.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/0c/5f/8435ba02c9278b6cec6f168db92e1d3280dd3af8f2225e20dc7c3be5ab22/aiortc-1.15.0-py3-none-any.whl",
+      "sha256": "4e1e54bff31a9c2cb654c7b7edc068085a7df53365e5df24a5cb24168e3f95f7"
+    },
+    {
+      "package": "av",
+      "version": "17.1.0",
+      "filename": "av-17.1.0-cp311-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/6b/f2/53a7cd34adb6a971d7e6d99663e74db286966c9db8afdca17472fdf0f98e/av-17.1.0-cp311-abi3-win_amd64.whl",
+      "sha256": "5df5c1172ef1cf65a1529d612f7da7798ce2cf82c1ff7212466b538a6cc7214c"
+    },
+    {
+      "package": "cffi",
+      "version": "2.1.1",
+      "filename": "cffi-2.1.1-cp312-cp312-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/d9/79/615cc094e2fb508cade7de88d3b4f6c4ec2bab695c97bce9153dc65aadf5/cffi-2.1.1-cp312-cp312-win_amd64.whl",
+      "sha256": "f53e442b08449d42821fa4a4fba000095af9f62742a500f978a9f557ec44339a"
+    },
+    {
+      "package": "cryptography",
+      "version": "50.0.1",
+      "filename": "cryptography-50.0.1-cp39-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/99/89/87ef49ffe383ef4e147d27b7bf2088fb0b54ea409dd87b5a89442e5828a5/cryptography-50.0.1-cp39-abi3-win_amd64.whl",
+      "sha256": "55d16b1ef3ee0958d893a977b19777887e546c9954ea81b200c3301a864013f2"
+    },
+    {
+      "package": "dnspython",
+      "version": "2.8.0",
+      "filename": "dnspython-2.8.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/ba/5a/18ad964b0086c6e62e2e7500f7edc89e3faa45033c71c1893d34eed2b2de/dnspython-2.8.0-py3-none-any.whl",
+      "sha256": "01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af"
+    },
+    {
+      "package": "google-crc32c",
+      "version": "1.8.0",
+      "filename": "google_crc32c-1.8.0-cp312-cp312-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/df/c0/87c2073e0c72515bb8733d4eef7b21548e8d189f094b5dad20b0ecaf64f6/google_crc32c-1.8.0-cp312-cp312-win_amd64.whl",
+      "sha256": "3cc0c8912038065eafa603b238abf252e204accab2a704c63b9e14837a854962"
+    },
+    {
+      "package": "ifaddr",
+      "version": "0.2.0",
+      "filename": "ifaddr-0.2.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/9c/1f/19ebc343cc71a7ffa78f17018535adc5cbdd87afb31d7c34874680148b32/ifaddr-0.2.0-py3-none-any.whl",
+      "sha256": "085e0305cfe6f16ab12d72e2024030f5d52674afad6911bb1eee207177b8a748"
+    },
+    {
+      "package": "pycparser",
+      "version": "3.0",
+      "filename": "pycparser-3.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl",
+      "sha256": "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992"
+    },
+    {
+      "package": "pyee",
+      "version": "14.0.0",
+      "filename": "pyee-14.0.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/81/12/5347938b1f9a6453f0dbdfcc3e2388a1320ef9b9ec17fbefbc4ab647ea98/pyee-14.0.0-py3-none-any.whl",
+      "sha256": "3ac2d3229a9677f7de2c33d7f52fe25b638a46b19c413fea2edc8c6d0a644e4d"
+    },
+    {
+      "package": "pylibsrtp",
+      "version": "1.0.0",
+      "filename": "pylibsrtp-1.0.0-cp310-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/c3/70/43db21af194580aba2d9a6d4c7bd8c1a6e887fa52cd810b88f89096ecad2/pylibsrtp-1.0.0-cp310-abi3-win_amd64.whl",
+      "sha256": "8d6527c4a78a39a8d397f8862a8b7cdad4701ee866faf9de4ab8c70be61fd34d"
+    },
+    {
+      "package": "pyOpenSSL",
+      "version": "26.4.0",
+      "filename": "pyopenssl-26.4.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/51/ad/2cf6d3fa2fae5c79e1ed9960c0d42badd0f94d81dd12b50604cdc839e648/pyopenssl-26.4.0-py3-none-any.whl",
+      "sha256": "f0eb0cb2d581d3ad2b9c489468485e7f2ab6727d08401bcf9d824c3caddf3c1c"
+    },
+    {
+      "package": "typing_extensions",
+      "version": "4.16.0",
+      "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"
+    }
+  ]
+}
