@@ -63,7 +63,7 @@ def make_release(pack: Path, target: str, build: Path, host_engine: str, env: di
         (stage / "runtime").mkdir()
         shutil.copy2(runtime, stage / "runtime" / runtime.name)
         shutil.copy2(pack, stage / "game.pck")
-        for relative in ("launch.py", "INSTALL.md", "PRIVACY.md", "tools/setup.py", "tools/runtime.py", "tools/windows_audio.json",
+        for relative in ("launch.py", "INSTALL.md", "PRIVACY.md", "tools/setup.py", "tools/start.py", "tools/runtime.py", "tools/windows_audio.json",
                          "companion/voice_bridge/requirements.txt"):
             destination = stage / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -79,18 +79,15 @@ def make_release(pack: Path, target: str, build: Path, host_engine: str, env: di
         godot_notices(stage / "licenses")
         if target.startswith("windows"):
             windows_python(build / "runtime-cache", stage / "runtime/python")
-            for name, command in (("Start Shadow Aim.cmd", "launch.py"),
-                                  ("Setup Shadow Aim.cmd", "tools\\setup.py --audio --codex --desktop")):
-                (stage / name).write_text('@echo off\ncd /d "%~dp0"\n'
-                    f'"runtime\\python\\python.exe" {command} %*\n'
-                    'if errorlevel 1 (echo See INSTALL.md for Python and setup help. & pause)\n',
-                    encoding="utf-8", newline="\r\n")
+            (stage / "Start Shadow Aim.cmd").write_text('@echo off\ncd /d "%~dp0"\n'
+                '"runtime\\python\\python.exe" tools\\start.py %*\n'
+                'if errorlevel 1 (echo See INSTALL.md for help. & pause)\n',
+                encoding="utf-8", newline="\r\n")
         else:
-            for name, command in (("Start Shadow Aim.sh", 'exec python3 "./launch.py" "$@"'),
-                                  ("Setup Shadow Aim.sh", 'exec python3 "./tools/setup.py" --audio --codex --desktop "$@"')):
-                script = stage / name
-                script.write_text('#!/bin/sh\nset -eu\ncd -- "$(dirname -- "$0")"\n' + command + '\n')
-                script.chmod(0o755)
+            script = stage / "Start Shadow Aim.sh"
+            script.write_text('#!/bin/sh\nset -eu\ncd -- "$(dirname -- "$0")"\n'
+                              'exec python3 "./tools/start.py" "$@"\n')
+            script.chmod(0o755)
         (stage / "release.json").write_text(json.dumps({"platform": target, "godot": GODOT_VERSION,
             "python_minimum": "3.11", "voice": "GPT-Live/Juniper access is account-dependent and experimental"}, indent=2) + "\n")
         manifest = []

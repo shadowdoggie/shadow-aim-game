@@ -68,7 +68,7 @@ jobs:
       - name: Unit and protocol tests without account calls
         run: python -m unittest discover -s tests -p "test_*.py" -v
       - name: Export failure classification
-        run: python -m unittest tools.test_package -v
+        run: python -m unittest tools.test_package tools.test_start -v
       - name: Full-duplex protocol fixtures
         run: python -m unittest companion.voice_bridge.test_bridge -v
 
@@ -118,15 +118,28 @@ jobs:
                  "APPDATA": str(root / "roaming"), "LOCALAPPDATA": str(root / "local")}
           env.pop("GODOT_BIN", None)
           env.pop("AIMCOACH_RUNTIME_ACTIVE", None)
-          if target.startswith("windows"):
-              # The distributed archive contains no third-party codec wheels.
-              # Verify the same pinned, app-local audio setup used after extraction.
-              subprocess.run([str(python), str(bundle / "tools/setup.py"), "--audio"],
-                             cwd=bundle, env=env, timeout=300, check=True)
-              subprocess.run([str(python), "-c", "from companion.voice_bridge import _load_media; _load_media()"],
-                             cwd=bundle, env=env, timeout=30, check=True)
-          result = subprocess.run([str(python), str(bundle / "launch.py"), "--headless", "--audio-driver",
-                                   "Dummy", "--quit-after", "30"], cwd=root, env=env, timeout=45)
+          # Exercise the actual user entrypoint twice: first-time setup and reuse.
+          # Installation is anonymous; these checks never sign in or run inference.
+          launcher = bundle / ("Start Shadow Aim.cmd" if target.startswith("windows") else "Start Shadow Aim.sh")
+          assert launcher.is_file()
+          assert not list(bundle.glob("Setup Shadow Aim.*"))
+          for attempt in (1, 2):
+              command = ([os.environ["COMSPEC"], "/d", "/c", str(launcher)]
+                         if target.startswith("windows") else ["sh", str(launcher)])
+              result = subprocess.run([*command, "--headless", "--audio-driver", "Dummy", "--quit-after", "30"],
+                                      cwd=bundle, env=env, timeout=600, capture_output=True, text=True)
+              print(f"Release launch {attempt}:\n{result.stdout}\n{result.stderr}")
+              if result.returncode or "setup could not finish" in result.stdout + result.stderr:
+                  raise SystemExit("Automatic first-launch setup failed")
+              if attempt == 2 and "Setting up " in result.stdout:
+                  raise SystemExit("Second launch unnecessarily repeated setup")
+          media_python = python if target.startswith("windows") else root / "data/runtime/venv/bin/python"
+          if not media_python.is_file():
+              media_python = python
+          subprocess.run([str(media_python), "-c", "from companion.voice_bridge import _load_media; _load_media()"],
+                         cwd=bundle, env=env, timeout=30, check=True)
+          subprocess.run([str(python), "-c", "from tools.start import codex_ready; from tools.runtime import default_data_dir; import os; from pathlib import Path; assert codex_ready(Path(os.environ['AIMCOACH_DATA_DIR']))"],
+                         cwd=bundle, env=env, timeout=30, check=True)
           log = root / "logs/game.log"
           output = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
           print(output)

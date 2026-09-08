@@ -85,11 +85,12 @@ def desktop_shortcut(data):
     launcher = applications / "shadow-aim.desktop"
     if any(c in str(ROOT) + str(data) for c in "\n\r"):
         raise RuntimeError("Move the app to a folder without line breaks before installing its shortcut.")
-    launch = " ".join((quoted(sys.executable), quoted(ROOT / "launch.py")))
+    packaged = (ROOT / "Start Shadow Aim.sh").is_file()
+    launch = quoted(ROOT / "Start Shadow Aim.sh") if packaged else " ".join((quoted(sys.executable), quoted(ROOT / "launch.py")))
     launcher.write_text("[Desktop Entry]\nType=Application\nName=Shadow Aim\n"
         "Comment=Native aim training with your ChatGPT coach\n"
         f"Exec=env {quoted('AIMCOACH_DATA_DIR=' + str(data))} {launch}\n"
-        f"Path={ROOT}\nTerminal=false\nCategories=Game;\n", encoding="utf-8")
+        f"Path={ROOT}\nTerminal={str(packaged).lower()}\nCategories=Game;\n", encoding="utf-8")
     launcher.chmod(0o755)
     print(f"App-menu shortcut installed: {launcher}")
 

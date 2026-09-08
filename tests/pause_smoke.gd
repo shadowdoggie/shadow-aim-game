@@ -20,6 +20,13 @@ func check(condition: bool, message: String) -> bool:
 		quit(1)
 	return condition
 
+func wait_wall_time(seconds: float) -> void:
+	# Pause bookkeeping uses monotonic wall time; headless frame deltas can run
+	# ahead of that clock on CI, so a SceneTreeTimer is not the same measurement.
+	var deadline := Time.get_ticks_usec() + int(seconds * 1000000.0)
+	while Time.get_ticks_usec() < deadline:
+		await process_frame
+
 func run() -> void:
 	arena = load("res://game/arena.gd").new()
 	root.add_child(arena)
@@ -43,7 +50,7 @@ func run() -> void:
 	var sample_count: int = arena._record.samples.size()
 	var settings_before: Dictionary = arena._settings.duplicate(true)
 	var before_frames := heartbeat.frames
-	await create_timer(0.15).timeout
+	await wait_wall_time(0.15)
 	var motion := InputEventMouseMotion.new()
 	motion.screen_relative = Vector2(400, -200)
 	arena._input(motion)
@@ -72,7 +79,7 @@ func run() -> void:
 	arena._notification(Node.NOTIFICATION_APPLICATION_FOCUS_OUT)
 	if not check(arena.paused and pause_requests == 2 and ended.is_empty(),"Focus loss must pause without discarding the round"): return
 	frozen_elapsed = arena._elapsed
-	await create_timer(0.04).timeout
+	await wait_wall_time(0.04)
 	arena.stop_round()
 	if not check(not arena._running and not arena.paused and not ended.completed and ended.duration_s == frozen_elapsed,"Ending from pause must emit an incomplete round with active duration only"): return
 	if not check(ended.pause_count == 2 and ended.paused_seconds >= 0.18,"Ending while paused must retain complete pause bookkeeping"): return
