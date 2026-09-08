@@ -68,7 +68,7 @@ jobs:
       - name: Unit and protocol tests without account calls
         run: python -m unittest discover -s tests -p "test_*.py" -v
       - name: Export failure classification
-        run: python -m unittest tools.test_package tools.test_start -v
+        run: python -m unittest tools.test_package tools.test_start tools.test_setup -v
       - name: Full-duplex protocol fixtures
         run: python -m unittest companion.voice_bridge.test_bridge -v
 
@@ -118,6 +118,12 @@ jobs:
                  "APPDATA": str(root / "roaming"), "LOCALAPPDATA": str(root / "local")}
           env.pop("GODOT_BIN", None)
           env.pop("AIMCOACH_RUNTIME_ACTIVE", None)
+          if not target.startswith("windows"):
+              # Keep CI's globally installed test media packages out of first-run detection.
+              import venv
+              clean_python = root / "bootstrap-python"
+              venv.EnvBuilder(with_pip=False).create(clean_python)
+              env["PATH"] = str(clean_python / "bin") + os.pathsep + env["PATH"]
           # Exercise the actual user entrypoint twice: first-time setup and reuse.
           # Installation is anonymous; these checks never sign in or run inference.
           launcher = bundle / ("Start Shadow Aim.cmd" if target.startswith("windows") else "Start Shadow Aim.sh")

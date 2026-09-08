@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 from pathlib import Path
 import platform
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -46,17 +48,72 @@ def install_codex(data):
     if shutil.which("codex", path=search):
         print("Codex is already installed; leaving its installation unchanged.")
         return
-    environment = dict(os.environ)
-    environment.update(CODEX_INSTALL_DIR=str(binary.parent), CODEX_HOME=str(data / "runtime/codex-package"),
-                       CODEX_NON_INTERACTIVE="1")
-    with tempfile.TemporaryDirectory(prefix="shadow-aim-setup-") as temporary:
-        windows = os.name == "nt"
-        name = "install.ps1" if windows else "install.sh"
-        installer = Path(temporary) / name
-        download("https://chatgpt.com/codex/" + name, installer, 2 * 1024 * 1024)
-        run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", installer] if windows else ["sh", installer], env=environment)
-    run([binary, "--version"])
+    install_codex_package(data, "windows-x86_64" if os.name == "nt" else "linux-x86_64")
     print("Codex installed for Shadow Aim. Sign in from the game's account controls.")
+
+
+# Official release packages include Codex's companion executables and resources.
+# Pin both URL and GitHub's published SHA256 instead of executing a remote script.
+CODEX_VERSION = "rust-v0.153.4"
+CODEX_PACKAGES = {
+    "linux-x86_64": ("codex-package-x86_64-unknown-linux-musl.tar.gz",
+        "a822187e1a2420c61c5926721bfbd878701ed95547c9bb0d4de4498a16ba1821", "codex"),
+    "windows-x86_64": ("codex-package-x86_64-pc-windows-msvc.tar.gz",
+        "a6ef3442cb12766a88b39311d79244289e4f9763e2c53ff4fbebc2cb653cc5f3", "codex.exe"),
+}
+
+
+def install_codex_package(data, target):
+    archive_name, expected, binary_name = CODEX_PACKAGES[target]
+    runtime = data / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    print("Downloading the official Codex desktop package…", flush=True)
+    with tempfile.TemporaryDirectory(prefix=".codex-install-", dir=runtime) as temporary:
+        temporary = Path(temporary)
+        archive = temporary / archive_name
+        download(f"https://github.com/openai/codex/releases/download/{CODEX_VERSION}/{archive_name}",
+                 archive, 256 * 1024 * 1024)
+        with archive.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
+                raise RuntimeError("Codex download checksum mismatch. Start Shadow Aim again to retry.")
+        staging = temporary / "package"
+        staging.mkdir()
+        with tarfile.open(archive, "r:gz") as package:
+            total = 0
+            for member in package:
+                path = Path(member.name)
+                if (path.is_absolute() or ".." in path.parts or "\\" in member.name
+                        or ":" in member.name or not path.parts
+                        or path.parts[0] not in {"bin", "codex-path", "codex-resources", "codex-package.json"}
+                        or not (member.isfile() or member.isdir())):
+                    raise RuntimeError("Unexpected path or file type in Codex package")
+                total += member.size
+                if total > 1024 * 1024 * 1024:
+                    raise RuntimeError("Codex package exceeded its expected unpacked size")
+                destination = staging / path
+                if member.isdir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with package.extractfile(member) as source, destination.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                destination.chmod(0o755 if member.mode & 0o111 else 0o644)
+        binary = staging / "bin" / binary_name
+        if not binary.is_file():
+            raise RuntimeError("Codex package is missing its launcher")
+        check_home = temporary / "check-home"
+        check_home.mkdir()
+        environment = {**os.environ, "CODEX_HOME": str(check_home)}
+        run([binary, "--version"], env=environment, timeout=30)
+        run([binary, "app-server", "--help"], env=environment, timeout=30,
+            stdout=subprocess.DEVNULL)
+        # Publish the executable last. Interrupted setup remains detectable and
+        # retries; none of the user's authentication or settings are touched.
+        files = sorted((p for p in staging.rglob("*") if p.is_file()), key=lambda p: p == binary)
+        for source in files:
+            destination = runtime / source.relative_to(staging)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, destination)
 
 
 def desktop_shortcut(data):
