@@ -4,6 +4,8 @@ A native aim trainer for Linux and Windows. Train with Juniper, review recorded 
 
 ## Download and play
 
+[Visit the website](https://shadowaim.shadowdog.cat/) for the latest download for your operating system.
+
 Download the archive for your system from [Releases](https://github.com/shadowdoggie/shadow-aim-game/releases). Follow the included [installation instructions](INSTALL.md). To run a source checkout, use `python3 launch.py` with Godot 4.7 and Python 3.11 or newer.
 
 Open **ChatGPT account** to sign in. Coaching uses your ChatGPT subscription through Codex. Your plan, remaining usage, and access to the requested models determine availability. There is no API-key billing fallback. Practice remains available without AI access.
