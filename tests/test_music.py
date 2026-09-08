@@ -24,7 +24,7 @@ class MusicTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.directory = Path(self.temp.name)
+        self.directory = Path(self.temp.name).resolve()
         self.root = self.directory / "picked-music"
         self.root.mkdir()
         self.library = MusicLibrary(self.directory / "appdata")

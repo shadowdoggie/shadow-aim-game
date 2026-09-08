@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from companion.storage import Storage
@@ -29,6 +30,13 @@ class StorageTests(unittest.TestCase):
         reopened.save_coaching(self.record["id"], result)
         self.assertEqual(self.storage.get_coaching(self.record["id"]), result)
         self.assertTrue(self.storage.list_sessions()[0]["coaching_available"])
+
+    def test_round_trip_when_directory_fsync_is_unavailable(self):
+        with patch("companion.storage.os.O_DIRECTORY", None, create=True):
+            report = self.storage.save_record(self.record)
+        reopened = Storage(self.temp.name)
+        self.assertEqual(reopened.get_session(self.record["id"]), self.record)
+        self.assertEqual(reopened.get_report(self.record["id"]), report)
 
     def test_godot_reencoded_retry_has_canonical_identity_without_mutation(self):
         self.record["settings"]["seed"] = 734

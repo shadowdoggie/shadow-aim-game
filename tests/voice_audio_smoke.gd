@@ -17,6 +17,23 @@ class VoiceDouble extends "res://game/voice_coach.gd":
 			uploads.append(payload.duplicate(true))
 		return OK
 
+class FixedClockVoice extends VoiceDouble:
+	func _mixer_quantum_seconds() -> float:
+		return 0.01
+
+class ManualMixerVoice extends VoiceDouble:
+	func _mixer_quantum_seconds() -> float:
+		return 4096.0 / AudioServer.get_mix_rate()
+	func prepare_output() -> void:
+		_generator = AudioStreamGenerator.new()
+		_generator.mix_rate = INPUT_RATE
+		_generator.buffer_length = PLAYBACK_MAX_RESERVE_SECONDS
+		_playback = _generator.instantiate_playback()
+		_playback_capacity_frames = _playback.get_frames_available()
+		_playback.start()
+		_output_rate = INPUT_RATE
+		_playback_waiting = true
+
 func _initialize() -> void:
 	call_deferred("run")
 	create_timer(5.0).timeout.connect(func(): quit(1))
@@ -25,7 +42,7 @@ func run() -> void:
 	Engine.max_fps = 240
 	var voice_script = load("res://game/voice_coach.gd")
 	assert(voice_script != null, "Voice script must parse")
-	var voice = voice_script.new()
+	var voice = FixedClockVoice.new()
 	var host = Host.new()
 	root.add_child(host)
 	host.add_child(voice)
@@ -91,42 +108,48 @@ func run() -> void:
 	protocol.set_volume(3.0)
 	assert(is_equal_approx(protocol.volume, 2.0), "Voice boost must stay bounded")
 	protocol.stop()
-	# Ordinary bursty delivery stays continuous after a short startup reserve.
-	var jitter = VoiceDouble.new()
+	# The real native mixer is advanced explicitly so CI scheduling cannot alter
+	# the promised 20/40 ms producer. A 4096-frame device block can consume ~93 ms
+	# at once: this exact phase reproduced two underruns with the old 120 ms reserve.
+	var jitter = ManualMixerVoice.new()
 	host.add_child(jitter)
 	jitter.setup(host)
-	jitter._speaker = AudioStreamPlayer.new()
-	jitter.add_child(jitter._speaker)
-	jitter._start_speaker(24000)
-	jitter.is_active = true
-	jitter.set_process(true)
-	jitter._enqueue_output({"audio":Marshalls.raw_to_base64(encoded.slice(0,960)), "sample_rate":24000, "num_channels":1})
+	jitter.prepare_output()
+	var reserve_frames: int = jitter._playback_reserve_frames()
+	jitter._enqueue_output(pcm_packet(480))
 	jitter._play_output()
-	assert(jitter._playback_waiting and jitter._output_bytes == 960, "The first 20 ms packet must wait for a jitter reserve")
-	jitter._enqueue_output({"audio":Marshalls.raw_to_base64(encoded.slice(960,5760)), "sample_rate":24000, "num_channels":1})
+	assert(jitter._playback_waiting and jitter._output_bytes == 960, "A single 20 ms packet must wait for a reserve")
+	jitter._enqueue_output(pcm_packet(reserve_frames - 480))
 	jitter._play_output()
-	assert(not jitter._playback_waiting, "Playback starts once 120 ms of audio is ready")
-	var delivered := 5760
-	var next_delivery_ms := Time.get_ticks_msec()
-	for delay_ms in [20, 40, 20, 20, 40, 20, 40, 20, 20, 40, 20, 40]:
-		next_delivery_ms += int(delay_ms)
-		while Time.get_ticks_msec() < next_delivery_ms:
-			await process_frame
-		var bytes := int(delay_ms) * 48
-		jitter._enqueue_output({"audio":Marshalls.raw_to_base64(encoded.slice(delivered,delivered + bytes)), "sample_rate":24000, "num_channels":1})
-		delivered += bytes
+	assert(not jitter._playback_waiting, "The complete device-aware reserve must start playback")
+	assert(jitter.get_audio_diagnostics().playback_reserve_ms >= 120 and jitter.get_audio_diagnostics().playback_reserve_ms <= 240)
+	var periods := [20,40,20,20,40,20,40,20,20,40,20,40]
+	var next_delivery := 20
+	var next_mix := 0.0
+	var delivery_index := 0
+	for now_ms in range(1000):
+		if now_ms >= next_mix:
+			jitter._playback.mix_audio(1.0,4096)
+			next_mix += 4096.0 * 1000.0 / AudioServer.get_mix_rate()
+		if now_ms % 4 == 0:
+			while now_ms >= next_delivery:
+				jitter._enqueue_output(pcm_packet(int(periods[delivery_index % periods.size()]) * 24))
+				delivery_index += 1
+				next_delivery += int(periods[delivery_index % periods.size()])
+			jitter._play_output()
 	var diagnostics: Dictionary = jitter.get_audio_diagnostics()
-	assert(diagnostics.playback_underruns == 0, "Normal 20/40 ms event batches must not underrun after startup")
-	assert(diagnostics.output_dropped_frames == 0, "Normal bursts must preserve all speech")
-	# After an actual network stall, recover with a reserve instead of fragments.
-	await create_timer(0.3).timeout
-	assert(jitter._playback_waiting and jitter.get_audio_diagnostics().playback_rebuffers >= 1, "A genuine playback stall must enter rebuffering")
-	jitter._enqueue_output({"audio":Marshalls.raw_to_base64(encoded.slice(0,960)), "sample_rate":24000, "num_channels":1})
+	assert(diagnostics.playback_underruns == 0, "Exact 20/40 ms delivery must survive whole device mix blocks: " + JSON.stringify(diagnostics))
+	assert(diagnostics.output_dropped_frames == 0, "Normal bursts must preserve every speech sample")
+	# Actual undersupply must still be detected, then recover without fragments.
+	jitter._playback.mix_audio(1.0,int(AudioServer.get_mix_rate() * 0.5))
 	jitter._play_output()
-	assert(jitter._playback_waiting, "A single late packet must not restart choppy speech")
-	jitter._enqueue_output({"audio":Marshalls.raw_to_base64(encoded.slice(960,5760)), "sample_rate":24000, "num_channels":1})
+	assert(jitter._playback_waiting and jitter.get_audio_diagnostics().playback_rebuffers == 1, "A genuine half-second supply gap must rebuffer")
+	jitter._enqueue_output(pcm_packet(480))
 	jitter._play_output()
-	assert(not jitter._playback_waiting, "A rebuilt reserve must restart playback")
+	assert(jitter._playback_waiting, "One late packet must not restart choppy speech")
+	jitter._enqueue_output(pcm_packet(reserve_frames - 480))
+	jitter._play_output()
+	assert(not jitter._playback_waiting, "A complete reserve must restart playback")
 	assert(jitter._microphone == null, "Synthetic playback must not open a microphone")
 	jitter.stop()
 	assert(not voice.is_active and voice.state == "off")
@@ -134,3 +157,8 @@ func run() -> void:
 	await create_timer(0.2).timeout
 	print("VOICE_AUDIO_SMOKE_PASS: phase continuity, ordered uploads, bursty playback without underruns, volume boost, mic off")
 	quit()
+
+func pcm_packet(frames: int) -> Dictionary:
+	var bytes := PackedByteArray()
+	bytes.resize(frames * 2)
+	return {"audio":Marshalls.raw_to_base64(bytes),"sample_rate":24000,"num_channels":1}

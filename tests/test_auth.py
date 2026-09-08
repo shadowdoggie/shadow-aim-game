@@ -70,7 +70,7 @@ class FakeFactory:
 class AuthTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.external = self.root / "external-codex"
         self.external.mkdir()
         self.external_auth = self.external / "auth.json"

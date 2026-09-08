@@ -128,11 +128,17 @@ class Storage:
                 os.replace(temp_path, final_path)
                 temp_path = None
                 new_file = True
-                directory_fd = os.open(self.trace_dir, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
+                # Windows cannot open directory descriptors for fsync. The
+                # trace itself is flushed above and replaced atomically on
+                # every platform; also persist the directory entry where the
+                # OS exposes that operation.
+                directory_flag = getattr(os, "O_DIRECTORY", None)
+                if directory_flag is not None:
+                    directory_fd = os.open(self.trace_dir, os.O_RDONLY | directory_flag)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
                 connection.execute(
                     "INSERT INTO sessions(id, started_at, drill, benchmark_key, record_sha256, report_json, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (record_id, record["started_at"], record["drill"], report["benchmark_key"], digest,

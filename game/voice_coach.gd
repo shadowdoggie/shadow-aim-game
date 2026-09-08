@@ -12,6 +12,8 @@ const MAX_UPLOAD_CHUNKS := 5
 const MAX_OUTPUT_BYTES := INPUT_RATE / 4 * 2
 const POLL_SECONDS := 0.02
 const PLAYBACK_RESERVE_SECONDS := 0.12
+const PLAYBACK_MIX_MARGIN_SECONDS := 0.06
+const PLAYBACK_MAX_RESERVE_SECONDS := 0.24
 
 var is_active := false
 var state := "off"
@@ -50,6 +52,8 @@ var _event_failures := 0
 var _last_warning_ms := -10000
 var _playback_waiting := true
 var _last_playback_skips := 0
+var _playback_capacity_frames := 0
+var _last_output_tick_ms := -1
 var _diagnostic_elapsed := 0.0
 var _last_capture_ms := -1
 var _input_sent_ms := 0
@@ -61,7 +65,8 @@ var _audio_diagnostics := {
 	"output_queue_peak_ms": 0, "upload_requests": 0,
 	"upload_total_ms": 0, "upload_max_ms": 0, "event_requests": 0,
 	"event_total_ms": 0, "event_max_ms": 0, "playback_rebuffers": 0,
-	"playback_underruns": 0
+	"playback_underruns": 0, "playback_tick_max_ms": 0,
+	"playback_reserve_ms": 0, "mixer_quantum_ms": 0
 }
 
 
@@ -140,6 +145,7 @@ func clear_playback() -> void:
 	_output_bytes = 0
 	_output_offset = 0
 	_playback_waiting = true
+	if is_instance_valid(_speaker): _speaker.stream_paused = true
 	if _playback != null:
 		# Generator buffers can only be cleared while inactive. Hold the audio lock
 		# across this short reset so the mixer never observes a half-reset stream.
@@ -296,13 +302,17 @@ func _start_speaker(rate: int) -> void:
 	_speaker.stop()
 	_generator = AudioStreamGenerator.new()
 	_generator.mix_rate = rate
-	_generator.buffer_length = 0.12
+	# Capacity is separate from the amount of audio we actually prefill.
+	_generator.buffer_length = PLAYBACK_MAX_RESERVE_SECONDS
 	_speaker.stream = _generator
 	_speaker.play()
+	_speaker.stream_paused = true
 	_playback = _speaker.get_stream_playback() as AudioStreamGeneratorPlayback
+	_playback_capacity_frames = _playback.get_frames_available()
 	_output_rate = rate
 	_playback_waiting = true
 	_last_playback_skips = _playback.get_skips()
+	_last_output_tick_ms = -1
 
 
 func _process(delta: float) -> void:
@@ -426,30 +436,52 @@ func _enqueue_output(event: Dictionary) -> void:
 		_warn_buffer("Oversized voice audio discarded")
 
 
+func _mixer_quantum_seconds() -> float:
+	# Together these measure the driver's last complete mixing block, not frame time.
+	return maxf(0.0, AudioServer.get_time_since_last_mix() + AudioServer.get_time_to_next_mix())
+
+
+func _playback_reserve_frames() -> int:
+	var quantum := _mixer_quantum_seconds()
+	# Until the driver reports its first mix, use a conservative bounded reserve.
+	var seconds := clampf(quantum + PLAYBACK_MIX_MARGIN_SECONDS, PLAYBACK_RESERVE_SECONDS, PLAYBACK_MAX_RESERVE_SECONDS) if quantum > 0.0 else PLAYBACK_MAX_RESERVE_SECONDS
+	_audio_diagnostics.mixer_quantum_ms = roundi(quantum * 1000.0)
+	_audio_diagnostics.playback_reserve_ms = roundi(seconds * 1000.0)
+	return ceili(_output_rate * seconds)
+
+
 func _play_output() -> void:
 	if _playback == null:
 		return
+	var now := Time.get_ticks_msec()
+	if _last_output_tick_ms >= 0:
+		_audio_diagnostics.playback_tick_max_ms = maxi(int(_audio_diagnostics.playback_tick_max_ms), now - _last_output_tick_ms)
+	_last_output_tick_ms = now
 	var skips := _playback.get_skips()
 	if skips > _last_playback_skips and not _playback_waiting:
 		_audio_diagnostics.playback_underruns += skips - _last_playback_skips
 		_audio_diagnostics.playback_rebuffers += 1
 		_playback_waiting = true
+		if is_instance_valid(_speaker): _speaker.stream_paused = true
+		_warn_buffer("Speaker rebuffer: " + JSON.stringify(get_audio_diagnostics()))
 	_last_playback_skips = skips
 	if _output_queue.is_empty():
 		return
+	var reserve := _playback_reserve_frames()
+	var buffered := _playback_capacity_frames - _playback.get_frames_available()
 	var filling_reserve := _playback_waiting
 	if _playback_waiting:
 		var queued_frames := 0
 		for i in _output_queue.size():
 			var queued: Dictionary = _output_queue[i]
 			queued_frames += ((queued.bytes as PackedByteArray).size() - (_output_offset if i == 0 else 0)) / (2 * int(queued.channels))
-		if queued_frames < int(_output_rate * PLAYBACK_RESERVE_SECONDS):
+		if queued_frames + buffered < reserve:
 			return
-		_playback_waiting = false
 	# Prefill the whole reserve before the mixer's next block, then decode at
 	# most 60 ms per frame. A reserve absorbs batched RTP delivery;
 	# after a stall, refill it before restarting instead of playing fragments.
-	var budget := mini(_playback.get_frames_available(), int(_output_rate * (PLAYBACK_RESERVE_SECONDS if filling_reserve else 0.06)))
+	var budget := mini(_playback.get_frames_available(), maxi(0, reserve - buffered))
+	if not filling_reserve: budget = mini(budget, int(_output_rate * 0.06))
 	while budget > 0 and not _output_queue.is_empty():
 		var chunk: Dictionary = _output_queue[0]
 		var bytes: PackedByteArray = chunk.bytes
@@ -468,6 +500,11 @@ func _play_output() -> void:
 		if _output_offset == bytes.size():
 			_output_queue.pop_front()
 			_output_offset = 0
+	if filling_reserve:
+		# The mixer cannot consume a half-decoded startup/recovery reserve.
+		_last_playback_skips = _playback.get_skips()
+		_playback_waiting = false
+		if is_instance_valid(_speaker): _speaker.stream_paused = false
 
 
 func _network_problem(detail: String, receiving: bool = false) -> void:
