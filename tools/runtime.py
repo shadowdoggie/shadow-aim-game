@@ -89,7 +89,11 @@ def windows_python(cache: Path, destination: Path) -> None:
         _extract_flat(zipped, destination)
     # Explicit isolated import paths: zip stdlib, interpreter DLLs, this app, and
     # bundled wheels. Neither PYTHONPATH nor the user's Python install is needed.
-    (destination / "python312._pth").write_text("python312.zip\n.\n../..\nLib/site-packages\nimport site\n")
+    # CPython passes these entries through PathCchCombineEx before normalizing
+    # them. Use Windows separators: that API strips trailing dots but does not
+    # recognize forward slashes, so '../..' can lose a parent-directory segment.
+    (destination / "python312._pth").write_text(
+        "python312.zip\n.\n..\\..\nLib\\site-packages\nimport site\n", encoding="utf-8", newline="\n")
 
 
 def install_windows_audio(destination: Path, manifest_path: Path) -> None:
