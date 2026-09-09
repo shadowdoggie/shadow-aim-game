@@ -15,6 +15,7 @@ MAX_SAMPLES = 120_000
 ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}\Z")
 DRILLS = {"clicking", "tracking", "switching"}
 TRAINING_KINDS = {"baseline", "practice", "retest", "free", "sensitivity"}
+SHOT_POSITION_FIELDS = {"aim_yaw", "aim_pitch", "target_yaw", "target_pitch", "target_radius"}
 
 
 def canonicalize_json(value: object) -> object:
@@ -133,6 +134,19 @@ def validate_record(record: dict) -> dict:
                 if not isinstance(item.get("hit"), bool):
                     raise ValueError("shot.hit must be boolean")
                 _number(item.get("error_deg"), "error_deg", 0, 180)
+                if SHOT_POSITION_FIELDS & item.keys():
+                    if not SHOT_POSITION_FIELDS <= item.keys():
+                        raise ValueError("Shot position requires all aim and target angles and radius")
+                    for field in ("aim_yaw", "target_yaw"):
+                        _number(item[field], "shot." + field, -1e8, 1e8)
+                    for field in ("aim_pitch", "target_pitch"):
+                        _number(item[field], "shot." + field, -90, 90)
+                    _number(item["target_radius"], "shot.target_radius", .001, 90)
+                    measured_error = angular_error(item["aim_yaw"], item["aim_pitch"], item["target_yaw"], item["target_pitch"])
+                    if abs(measured_error - item["error_deg"]) > .005:
+                        raise ValueError("Shot position does not match its recorded angular error")
+                    if item["hit"] and measured_error > item["target_radius"] + .005:
+                        raise ValueError("Successful shot position is outside the target")
             else:
                 if item.get("type") not in {"spawn", "hit", "despawn"}:
                     raise ValueError("Unknown event type")
@@ -159,6 +173,57 @@ def angular_error(yaw: float, pitch: float, target_yaw: float, target_pitch: flo
     d_yaw = math.radians(angle_delta(yaw, target_yaw))
     cosine = math.sin(p1) * math.sin(p2) + math.cos(p1) * math.cos(p2) * math.cos(d_yaw)
     return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+
+
+def shot_position(shot: dict) -> dict | None:
+    """Exact shot-time angular offset; x is target-right, y is target-up, radius 1 is edge.
+
+    This locates the aim ray within the target's angular silhouette, not a surface UV
+    or a reconstructed bullet decal. Older shots have no direction and stay unknown.
+    """
+    if not SHOT_POSITION_FIELDS <= shot.keys():
+        return None
+    yaw, pitch = math.radians(shot["aim_yaw"]), math.radians(shot["aim_pitch"])
+    target_yaw, target_pitch = math.radians(shot["target_yaw"]), math.radians(shot["target_pitch"])
+    aim = (math.sin(yaw) * math.cos(pitch), math.sin(pitch), -math.cos(yaw) * math.cos(pitch))
+    right = (math.cos(target_yaw), 0.0, math.sin(target_yaw))
+    up = (-math.sin(target_yaw) * math.sin(target_pitch), math.cos(target_pitch),
+          math.cos(target_yaw) * math.sin(target_pitch))
+    x = sum(a * b for a, b in zip(aim, right))
+    y = sum(a * b for a, b in zip(aim, up))
+    length = math.hypot(x, y)
+    error = angular_error(shot["aim_yaw"], shot["aim_pitch"], shot["target_yaw"], shot["target_pitch"])
+    radial = error / shot["target_radius"]
+    if length < 1e-12:
+        # At the exact antipode there is no unique direction around the target.
+        x, y = (0.0, 0.0) if error < 1e-5 else (None, None)
+    else:
+        x, y = x / length * radial, y / length * radial
+    return {"x_radius": x, "y_radius": y, "radial_radius": radial}
+
+
+def _shot_placement(shots: list[dict]) -> tuple[dict, list[dict]]:
+    positioned = [(shot, shot_position(shot)) for shot in shots]
+    located = [(shot, offset) for shot, offset in positioned if offset is not None]
+    hit_offsets = [offset for shot, offset in located if shot["hit"]]
+    total_hits = sum(shot["hit"] for shot in shots)
+    center = sum(offset["radial_radius"] <= .5 + 1e-7 for offset in hit_offsets)
+    edge = sum(offset["radial_radius"] >= .8 - 1e-7 for offset in hit_offsets)
+    directions = {name: sum(offset[axis] is not None and sign * offset[axis] > 1e-6 for offset in hit_offsets)
+                  for name, axis, sign in (("left", "x_radius", -1), ("right", "x_radius", 1),
+                                           ("below", "y_radius", -1), ("above", "y_radius", 1))}
+    summary = {"available": bool(hit_offsets), "recorded_shots": len(shots),
+        "located_shots": len(located), "recorded_hits": total_hits, "located_hits": len(hit_offsets),
+        "unknown_position_hits": total_hits - len(hit_offsets),
+        "coordinates": "Exact shot-time angular offset from target center: right/up positive; 100% of target angular radius is the edge. Not a 3D surface impact.",
+        "zones": {"center": center, "middle": len(hit_offsets) - center - edge, "edge": edge},
+        "zone_definition": "Center: inner half-radius. Edge: outer 20% of radius. Zones describe placement, not extra score.",
+        "hit_directions": directions,
+        "direction_definition": "Horizontal and vertical counts overlap; a top-right hit counts as both above and right."}
+    examples = [{"t": shot["t"], "target_id": shot["target_id"], "hit": shot["hit"],
+                 **{name: _rounded(value) for name, value in offset.items()}}
+                for shot, offset in located[:6]]
+    return summary | {"examples": examples}, hit_offsets
 
 
 def benchmark_key(record: dict) -> str:
@@ -263,6 +328,26 @@ def analyze_record(record: dict) -> dict:
     add("accuracy_pct", hits / len(shots) * 100 if shots else None, "%",
         "Successful shots divided by all recorded shots; not tracking time on target.", ["shots-summary"])
 
+    placement, hit_offsets = _shot_placement(shots)
+    located_hits = len(hit_offsets)
+    evidence.append({"id": "shot-placement-summary", "kind": "aggregate",
+        "summary": "Exact click locations relative to target center; older unlocated shots are excluded",
+        "data": placement})
+    placement_evidence = ["shot-placement-summary"]
+    add("hit_position_coverage_pct", located_hits / hits * 100 if hits else None, "%",
+        "Share of successful shots with exact shot-time position data; older hits without it are unknown.", placement_evidence)
+    add("mean_hit_offset_pct_radius", sum(item["radial_radius"] for item in hit_offsets) / located_hits * 100 if located_hits else None,
+        "% radius", "Mean angular distance from target center among located hits: 0=center, 100=edge.", placement_evidence)
+    add("center_hit_pct", placement["zones"]["center"] / located_hits * 100 if located_hits else None, "%",
+        "Share of located successful shots within the inner half of the target angular radius.", placement_evidence)
+    add("edge_hit_pct", placement["zones"]["edge"] / located_hits * 100 if located_hits else None, "%",
+        "Share of located successful shots in the outer 20% of target angular radius; ordinary hits still score equally.", placement_evidence)
+    for axis, name, unit in (("x_radius", "hit_horizontal_bias_pct_radius", "% radius; right+"),
+                             ("y_radius", "hit_vertical_bias_pct_radius", "% radius; up+")):
+        values = [item[axis] for item in hit_offsets if item[axis] is not None]
+        add(name, sum(values) / len(values) * 100 if values else None, unit,
+            "Mean signed target-relative offset among located hits; opposite sides can cancel, so read with mean hit distance.", placement_evidence)
+
     intervals = [b["t"] - a["t"] for a, b in zip(samples, samples[1:]) if b["t"] > a["t"]]
     span = samples[-1]["t"] - samples[0]["t"] if len(samples) > 1 else 0
     hz = (len(intervals) / span) if span else 0
@@ -350,6 +435,8 @@ def analyze_record(record: dict) -> dict:
             "duration_s": record["duration_s"], "benchmark_key": benchmark_key(record), "valid": valid,
             "quality": {"flags": flags, "usable_for_coaching": usable, "sample_hz": round(hz, 2)},
             "metrics": metrics, "evidence": evidence}
+    report["shot_placement"] = {key: value for key, value in placement.items() if key != "examples"}
+    report["shot_placement"]["evidence_id"] = prefix + "shot-placement-summary"
     if "training_context" in record:
         report["training_context"] = canonicalize_json(record["training_context"])
     if record["drill"] == "tracking":

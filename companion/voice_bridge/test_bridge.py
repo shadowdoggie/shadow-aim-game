@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from companion.voice_bridge import APP_TOOL_NAMESPACE, EFFORT, VoiceBridge, VoiceError, _Session, _app_arguments
+from companion.voice_bridge import APP_TOOL_NAMESPACE, CONTROL_EFFORT, VoiceBridge, VoiceError, _Session, _app_arguments
 
 
 def tool_request(name, arguments, call_id="call-1"):
@@ -129,7 +129,54 @@ class VoiceBridgeTests(unittest.TestCase):
             session.media_event({"type": "input_transcript.added", "item": {"text": "Can you explain?"}})
             session.media_event({"type": "output_transcript.added", "item": {"text": "Yes."}})
             events = voice.events()["events"]
-            self.assertEqual([event["role"] for event in events], ["user", "assistant"])
+            self.assertEqual([event["role"] for event in events if event["type"] == "transcript"],
+                             ["user", "assistant"])
+        asyncio.run(scenario())
+
+    def test_v3_user_speech_events_flush_once_and_ignore_assistant_or_empty_input(self):
+        async def scenario():
+            voice = VoiceBridge()
+            session = _Session(voice, 0)
+            session.rpc = AsyncMock(return_value={})
+            session.media_event({"type": "turn.created", "turn": {"id": "answer", "role": "assistant"}})
+            session.media_event({"type": "output_transcript.added", "item": {"text": "Playing your song."}})
+            session.media_event({"type": "input_transcript.added", "item": {"text": "  "}})
+            await session.update_context({"playing": False, "music": {"state": "playing"}})
+            self.assertFalse(session.user_speaking)
+            self.assertFalse(any(event["type"].startswith("user_speech_") for event in voice.events()["events"]))
+
+            session.media_event({"type": "input_transcript.added", "item": {"text": "Wait"}})
+            session.media_event({"type": "input_transcript.added", "item": {"text": "please"}})
+            session.media_event({"type": "turn.created", "turn": {"id": "question", "role": "user"}})
+            session.media_event({"type": "turn.delta", "turn_id": "question"})
+            session.media_event({"type": "turn.done", "turn": {"id": "answer", "role": "assistant"}})
+            self.assertTrue(session.user_speaking, "The assistant finishing must not release a user-speech mute")
+            session.media_event({"type": "turn.done", "turn": {"id": "question", "role": "user", "transcript": "Wait please"}})
+            session.media_event({"type": "turn.done", "turn": {"id": "question", "role": "user"}})
+            events = voice.events()["events"]
+            speech = [event["type"] for event in events if event["type"].startswith("user_speech_")]
+            self.assertEqual(speech, ["user_speech_started", "user_speech_stopped"])
+            start = next(i for i, event in enumerate(events) if event["type"] == "user_speech_started")
+            self.assertEqual(events[start + 1]["text"], "Wait", "Mute must precede the first user transcript")
+            self.assertFalse(session.user_speaking)
+            await asyncio.gather(*list(session.tasks))
+        asyncio.run(scenario())
+
+    def test_v3_overlapping_user_turns_release_playback_only_after_the_last_user_done(self):
+        async def scenario():
+            voice = VoiceBridge()
+            session = _Session(voice, 0)
+            for turn_id in ("first", "second"):
+                session.media_event({"type": "turn.created", "turn": {"id": turn_id, "role": "user"}})
+            session.media_event({"type": "turn.done", "turn": {"id": "first", "role": "user"}})
+            self.assertTrue(session.user_speaking)
+            # Preserve the known role if a final event omits it.
+            session.media_event({"type": "turn.done", "turn": {"id": "second"}})
+            self.assertFalse(session.user_speaking)
+            self.assertEqual([event["type"] for event in voice.events()["events"]
+                              if event["type"].startswith("user_speech_")],
+                             ["user_speech_started", "user_speech_stopped"])
+            await asyncio.gather(*list(session.tasks))
         asyncio.run(scenario())
 
     def test_new_game_context_discards_an_outdated_waiting_announcement(self):
@@ -209,12 +256,114 @@ class VoiceBridgeTests(unittest.TestCase):
             self.assertEqual(len(calls), before)
         asyncio.run(scenario())
 
+    def test_menu_user_turn_refreshes_partial_library_without_repeating_unchanged_state(self):
+        async def scenario():
+            state = {"phase": "music", "private_path": "/private/music",
+                "audio": {"voice": 80, "music": 40, "game": 60, "private_path": "/private/audio"},
+                "music": {"state": "playing", "playing": True, "paused": False, "volume": .4,
+                    "position_s": 12, "revision": 8, "track": {"id": "track1", "title": "First song",
+                    "artist": "Artist", "path": "/private/music/song.flac"}},
+                "music_library": {"folder_selected": True, "status": "scanning", "total": 12,
+                    "scanned": 15, "skipped": 3, "complete": False, "error": None,
+                    "folder": "/private/music"}}
+            reads = []
+
+            def handler(name, args):
+                reads.append((name, args))
+                return {"status": "completed", "state": state}
+
+            session = _Session(VoiceBridge(action_handler=handler), 0)
+            session.rpc = AsyncMock(return_value={})
+            self.assertEqual(reads, [], "Indexing by itself must not trigger model/context work")
+            session.media_event({"type": "turn.created", "turn": {"id": "menu-question", "role": "user"}})
+            await asyncio.gather(*list(session.tasks))
+            methods = [call.args[0] for call in session.rpc.call_args_list]
+            self.assertEqual(methods, ["thread/inject_items", "thread/realtime/appendText"])
+            backing = session.rpc.call_args_list[0].args[1]["items"][0]["content"][0]["text"]
+            self.assertEqual(backing, session.rpc.call_args_list[1].args[1]["text"])
+            compact = json.loads(backing.split("\n", 1)[1])
+            self.assertEqual(set(compact), {"audio", "music", "music_library", "observed_at_unix_s"})
+            self.assertLess(abs(time.time() - compact["observed_at_unix_s"]), 2)
+            self.assertEqual(compact["music_library"]["total"], 12)
+            self.assertFalse(compact["music_library"]["complete"])
+            self.assertNotIn("/private", backing)
+            self.assertNotIn("position_s", backing)
+
+            # Playback ticks and repeated turn boundaries are not new context.
+            state["music"].update(position_s=13, revision=9)
+            session.media_event({"type": "turn.done", "turn": {"id": "menu-question", "role": "user"}})
+            await asyncio.gather(*list(session.tasks))
+            self.assertEqual(session.rpc.call_count, 2)
+            state["music_library"].update(total=19, scanned=22)
+            self.assertEqual(session.rpc.call_count, 2, "Per-file progress must remain local")
+            session.media_event({"type": "turn.created", "turn": {"id": "next-question", "role": "user"}})
+            await asyncio.gather(*list(session.tasks))
+            self.assertEqual(session.rpc.call_count, 4)
+            latest = session.rpc.call_args.args[1]["text"]
+            self.assertEqual(json.loads(latest.split("\n", 1)[1])["music_library"]["total"], 19)
+            self.assertTrue(all(name == "get_game_state" and not args for name, args in reads))
+        asyncio.run(scenario())
+
+    def test_overlapping_user_events_share_one_local_app_state_read(self):
+        async def scenario():
+            entered, release = threading.Event(), threading.Event()
+            reads = []
+
+            def handler(name, args):
+                reads.append(name)
+                entered.set()
+                release.wait(1)
+                return {"status": "completed", "state": {"music_library": {
+                    "folder_selected": True, "status": "failed", "error": "/private/library: access denied"}}}
+
+            session = _Session(VoiceBridge(action_handler=handler), 0)
+            session.rpc = AsyncMock(return_value={})
+            first = asyncio.create_task(session.inject_latest_live_state())
+            second = asyncio.create_task(session.inject_latest_live_state())
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                release.set()
+                await asyncio.gather(first, second)
+            finally:
+                release.set()
+            self.assertEqual(reads, ["get_game_state"])
+            self.assertEqual(session.rpc.call_count, 2)
+            self.assertNotIn("/private/library", str(session.rpc.call_args_list))
+        asyncio.run(scenario())
+
+    def test_unavailable_app_snapshot_keeps_voice_connected_and_full_context_invalidates_dedup(self):
+        async def scenario():
+            voice = VoiceBridge(action_handler=lambda *args: (_ for _ in ()).throw(OSError("local read failed")))
+            voice._set_state("connected")
+            session = _Session(voice, 0)
+            session.rpc = AsyncMock(return_value={})
+            await session.inject_latest_live_state()
+            self.assertEqual(voice.status()["state"], "connected")
+            session.rpc.assert_not_called()
+            voice.action_handler = lambda *args: {"status": "completed", "state": {"audio": {"music": 40}}}
+            await session.inject_latest_live_state()
+            await session.update_context({"phase": "train", "playing": False})
+            before = session.rpc.call_count
+            await session.inject_latest_live_state()
+            self.assertEqual(session.rpc.call_count, before + 2,
+                             "A full context replacement must not leave an older audio/library snapshot authoritative")
+        asyncio.run(scenario())
+
     def test_app_controls_reject_paths_unknown_actions_and_invalid_volume(self):
         invalid = [
             ("get_game_state", {"path": "/tmp/song"}),
             ("run_shell", {"command": "play music"}),
             ("music_control", {"action": "play", "track_id": "../../music/song.mp3"}),
             ("music_control", {"action": "play", "query": "song", "track_id": "song"}),
+            ("music_control", {"action": "play", "mood": "relaxing", "query": "song"}),
+            ("music_control", {"action": "play", "mood": "anything"}),
+            ("music_control", {"action": "play", "mix": "jazz", "query": "song"}),
+            ("music_control", {"action": "play", "mix": "jazz", "mood": "relaxing"}),
+            ("music_control", {"action": "play", "mix": " "}),
+            ("music_control", {"action": "play", "mix": "j" * 201}),
+            ("music_control", {"action": "play", "mix": ["jazz"]}),
+            ("music_control", {"action": "next", "mix": "jazz"}),
+            ("music_control", {"action": "next", "mood": "relaxing"}),
             ("music_control", {"action": "pause", "query": "song"}),
             ("music_control", {"action": "play", "query": "   "}),
             ("set_audio_volume", {"channel": "microphone", "operation": "set", "value": 20}),
@@ -228,6 +377,42 @@ class VoiceBridgeTests(unittest.TestCase):
                     _app_arguments(name, arguments)
         self.assertEqual(_app_arguments("music_control", {"action": "play", "query": "  artist  "}),
                          {"action": "play", "query": "artist"})
+        self.assertEqual(_app_arguments("music_control", {"action": "play", "mood": "relaxing"}),
+                         {"action": "play", "mood": "relaxing"})
+
+    def test_category_request_dispatches_mix_without_a_guessed_song_query(self):
+        async def scenario():
+            executed = []
+            outcome = {"status": "completed", "track": {"id": "jazz1", "title": "Selected jazz piece"},
+                       "changed_track": True, "confirmed_at_unix_s": time.time()}
+            session = _Session(VoiceBridge(action_handler=lambda name, args:
+                executed.append((name, args)) or outcome), 0)
+            session.thread_id = "voice-thread"
+            session.send = AsyncMock()
+            await session.handle_app_action("mix-request", tool_request("music_control",
+                {"action": "play", "mix": "  jazz  "}))
+            reply = session.send.call_args.args[0]["result"]
+            self.assertTrue(reply["success"])
+            self.assertEqual(json.loads(reply["contentItems"][0]["text"]), outcome)
+            self.assertEqual(executed, [("music_control", {"action": "play", "mix": "jazz"})])
+        asyncio.run(scenario())
+
+    def test_mood_request_returns_actual_unchanged_track_without_inventing_a_switch(self):
+        async def scenario():
+            executed = []
+            outcome = {"status": "completed", "track": {"id": "quiet1", "title": "Quiet piece"},
+                       "changed_track": False, "confirmed_at_unix_s": time.time()}
+            session = _Session(VoiceBridge(action_handler=lambda name, args:
+                executed.append((name, args)) or outcome), 0)
+            session.thread_id = "voice-thread"
+            session.send = AsyncMock()
+            await session.handle_app_action("mood-request", tool_request("music_control",
+                {"action": "play", "mood": "relaxing"}))
+            reply = session.send.call_args.args[0]["result"]
+            self.assertTrue(reply["success"])
+            self.assertEqual(json.loads(reply["contentItems"][0]["text"]), outcome)
+            self.assertEqual(executed, [("music_control", {"action": "play", "mood": "relaxing"})])
+        asyncio.run(scenario())
 
     def test_control_completion_waits_for_ack_and_duplicate_call_does_not_repeat_change(self):
         async def scenario():
@@ -326,6 +511,67 @@ class VoiceBridgeTests(unittest.TestCase):
                 await asyncio.gather(reader, return_exceptions=True)
         asyncio.run(scenario())
 
+    def test_protocol_rejects_new_controls_from_a_completed_backing_turn(self):
+        async def scenario():
+            executed = []
+            session = _Session(VoiceBridge(action_handler=lambda *args:
+                executed.append(args) or {"status": "completed"}), 0)
+            session.thread_id = "voice-thread"
+            stream = asyncio.StreamReader()
+            session.process = SimpleNamespace(stdout=stream)
+            replied = asyncio.Event()
+            replies = []
+
+            async def send(reply):
+                replies.append(reply)
+                replied.set()
+
+            session.send = send
+            reader = asyncio.create_task(session.read())
+            events = [
+                {"method": "turn/started", "params": {"threadId": "voice-thread", "turn": {"id": "turn-1", "status": "inProgress"}}},
+                {"method": "turn/completed", "params": {"threadId": "voice-thread", "turn": {"id": "turn-1", "status": "completed"}}},
+                {"id": "late-request", "method": "item/tool/call", "params": tool_request("music_control", {"action": "next"})}]
+            stream.feed_data("".join(json.dumps(event) + "\n" for event in events).encode())
+            try:
+                await asyncio.wait_for(replied.wait(), 1)
+                self.assertEqual(executed, [])
+                self.assertFalse(replies[0]["result"]["success"])
+                self.assertIn("out of date", replies[0]["result"]["contentItems"][0]["text"])
+            finally:
+                session.closed = True
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+        asyncio.run(scenario())
+
+    def test_expired_controls_and_volume_queued_past_turn_completion_are_not_applied(self):
+        async def scenario():
+            executed = []
+            session = _Session(VoiceBridge(action_handler=lambda *args:
+                executed.append(args) or {"status": "completed"}), 0)
+            session.thread_id = "voice-thread"
+            session.send = AsyncMock()
+            params = {"threadId": "voice-thread", "turn": {"id": "turn-1"}}
+            with patch("companion.voice_bridge.time.monotonic", return_value=time.monotonic() - 121):
+                session.record_backing_turn("turn/started", params)
+            await session.handle_app_action("expired", tool_request("music_control", {"action": "next"}))
+            self.assertEqual(executed, [])
+            self.assertFalse(session.send.call_args.args[0]["result"]["success"])
+            await session.handle_app_action("read", tool_request("get_game_state", {}, "read-call"))
+            self.assertEqual(len(executed), 1, "A stale turn may still inspect state without changing it")
+
+            fresh = {"threadId": "voice-thread", "turn": {"id": "turn-2"}}
+            session.record_backing_turn("turn/started", fresh)
+            await session.action_lock.acquire()
+            task = asyncio.create_task(session.run_app_action("queued", "set_audio_volume",
+                {"channel": "music", "operation": "decrease", "value": 10}, "turn-2"))
+            await asyncio.sleep(0)
+            session.record_backing_turn("turn/completed", fresh)
+            session.action_lock.release()
+            self.assertEqual((await task)["status"], "failed")
+            self.assertEqual(len(executed), 1, "Waiting on an earlier volume action must not revive an old request")
+        asyncio.run(scenario())
+
     def test_music_stop_can_cancel_while_an_earlier_play_is_still_preparing(self):
         async def scenario():
             stopped = threading.Event()
@@ -346,6 +592,19 @@ class VoiceBridgeTests(unittest.TestCase):
             stop = await asyncio.wait_for(session.run_app_action("stop", "music_control", {"action": "stop"}), 1)
             self.assertEqual(stop["status"], "completed")
             self.assertEqual((await play)["status"], "failed")
+        asyncio.run(scenario())
+
+    def test_unexpected_native_control_failure_logs_class_without_private_exception_text(self):
+        async def scenario():
+            def handler(name, arguments):
+                raise FileNotFoundError("/private/music/folder")
+
+            session = _Session(VoiceBridge(action_handler=handler), 0)
+            with self.assertLogs("shadow_aim.voice", level="WARNING") as logged:
+                result = await session.run_app_action("failure-test", "music_control", {"action": "next"})
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("error_type=FileNotFoundError", logged.output[0])
+            self.assertNotIn("/private", str(logged.output))
         asyncio.run(scenario())
 
     def test_selected_app_auth_environment_is_used_without_api_keys(self):
@@ -420,7 +679,7 @@ class VoiceBridgeTests(unittest.TestCase):
                 elif method == "thread/realtime/listVoices":
                     result = {"voices": {"v1": ["juniper"]}}
                 elif method == "thread/start":
-                    result = {"model": params["model"], "reasoningEffort": EFFORT,
+                    result = {"model": params["model"], "reasoningEffort": CONTROL_EFFORT,
                               "thread": {"id": "voice-thread"}}
                 elif method == "thread/realtime/start":
                     feed({"method": "thread/realtime/started", "params": {"version": "v3"}})
@@ -435,6 +694,7 @@ class VoiceBridgeTests(unittest.TestCase):
                                     RTCSessionDescription=lambda *args, **kwargs: kwargs)
             scoring_command = ["fixture-codex", "app-server", "-c", "features.code_mode=false",
                 "-c", "features.code_mode_host=false", "-c", "features.shell_tool=false",
+                "-c", 'model="scoring-model-fixture"', "-c", 'model_reasoning_effort="high"',
                 "-c", 'developer_instructions="scoring-only fixture"']
             launch = AsyncMock(return_value=process)
             try:
@@ -450,6 +710,10 @@ class VoiceBridgeTests(unittest.TestCase):
                 self.assertEqual(overrides["features.code_mode_host"], "true")
                 self.assertEqual(overrides["features.code_mode"], "true")
                 self.assertEqual(overrides["features.shell_tool"], "false", "The wrapper must not enable shell access")
+                self.assertEqual(json.loads(overrides["model"]), "gpt-5.6-luna")
+                self.assertEqual(json.loads(overrides["model_reasoning_effort"]), "low")
+                self.assertEqual(thread["model"], "gpt-5.6-luna")
+                self.assertEqual(thread["config"]["model_reasoning_effort"], "low")
                 backing = json.loads(overrides["developer_instructions"])
                 self.assertEqual(thread["baseInstructions"], backing)
                 self.assertTrue(thread["developerInstructions"].startswith(backing))

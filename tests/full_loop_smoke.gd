@@ -27,7 +27,7 @@ func run() -> void:
 		await create_timer(1).timeout
 		elapsed += 1
 		if elapsed % 20 == 0: print("FULL_LOOP_WAITING ",elapsed)
-	if not check(not scene.recommendation.is_empty(),"Sol/high result reached native UI"): return
+	if not check(not scene.recommendation.is_empty(),"Sol/medium result reached native UI"): return
 	print("FULL_LOOP_COACH_READY ",elapsed,"s")
 	if DisplayServer.get_name() != "headless":
 		await RenderingServer.frame_post_draw
@@ -50,7 +50,7 @@ func run() -> void:
 	if not check(scene.arena._settings.target_scale == record.settings.target_scale,"Retest restored baseline difficulty"): return
 	if not check(scene.arena._settings.seed != record.settings.seed,"Retest has a fresh sequence"): return
 	scene.arena.stop_round()
-	print("FULL_LOOP_PASS: native telemetry, real Sol/high coaching, replay, prescription, retest")
+	print("FULL_LOOP_PASS: native telemetry, real Sol/medium coaching, replay, prescription, retest")
 	root.remove_child(scene)
 	scene.queue_free()
 	await process_frame

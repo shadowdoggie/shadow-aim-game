@@ -42,7 +42,7 @@ func show_intro() -> void:
 	host._paragraph(body, "Try three nearby settings in short clicking and tracking rounds. Your coach checks which one helps you stay accurate and move comfortably.", 21)
 	var card: VBoxContainer = host._card(body)
 	host._label(card, "12 short rounds · about 5–6 minutes", 24)
-	host._paragraph(card, "Each round starts with 5 seconds to settle in, then measures 20 seconds. Take a breather between rounds whenever you need one.")
+	host._paragraph(card, "5 seconds of unscored warmup → targets reset → 20 seconds scored. Take a breather between rounds whenever you need one.")
 	host._paragraph(card, "The settings are labelled A, B and C while you play so the numbers do not influence you. Keep your mouse DPI unchanged.")
 	host._paragraph(card, "This finds a promising setting to try; it cannot establish your perfect sensitivity in one session.", 16)
 	if not message.is_empty(): host._paragraph(card, message, 17, LIME)
@@ -160,7 +160,7 @@ func _show_next() -> void:
 	var label: String = str(labels.get(str(block.candidate_id),"?"))
 	host._label(card, "Round %d/%d · Setting %s · %s" % [index+1,total,label,TITLES.get(str(block.drill),str(block.drill))], 25)
 	host._paragraph(card, "Hold left mouse and follow the moving target." if block.drill == "tracking" else "Click each bright target with a fresh press.", 21, TEXT)
-	host._paragraph(card, "5 seconds to settle in, then 20 seconds measured. Play at a comfortable pace; there is no need to force a score.")
+	host._paragraph(card, "5 seconds warmup, then targets reset and the 20-second score starts. The warmup does not count.")
 	if not message.is_empty(): host._paragraph(card,message,17,LIME)
 	if not pending_record.is_empty():
 		host._button(card,"Retry saving this round",_submit_round,true)
@@ -180,7 +180,7 @@ func _begin_block() -> void:
 	config.duration_s = 5.0
 	# Adaptation uses a different sequence; the measured sequence remains matched.
 	config.seed = int(config.get("seed",0)) + 7919
-	progress_text = "Sensitivity %d/%d · Setting %s · Settle in (unscored)" % [_block_index()+1,experiment.blocks.size(),labels.get(str(block.candidate_id),"?")]
+	progress_text = "Sensitivity %d/%d · Setting %s · 5s warmup, then 20s scored" % [_block_index()+1,experiment.blocks.size(),labels.get(str(block.candidate_id),"?")]
 	host.stage = "sensitivity"
 	host._begin_round(str(block.drill),config)
 
@@ -198,20 +198,35 @@ func on_round_finished(record: Dictionary) -> void:
 	if block.is_empty(): return
 	if warming:
 		warming = false
-		progress_text = "Sensitivity %d/%d · Setting %s · Measuring" % [_block_index()+1,experiment.blocks.size(),labels.get(str(block.candidate_id),"?")]
+		progress_text = "Sensitivity %d/%d · Setting %s · SCORING" % [_block_index()+1,experiment.blocks.size(),labels.get(str(block.candidate_id),"?")]
 		host.is_playing = true
 		host.crosshair.show()
 		host.hud.show()
 		# The user is already aiming: begin measurement directly, with no second countdown.
-		host.arena.start_round(str(block.drill),block.settings.duplicate(true))
 		host.current_drill = str(block.drill)
 		host.current_round_settings = block.settings.duplicate(true)
+		host.arena.start_round(str(block.drill),block.settings.duplicate(true))
 		if host.has_method("_voice_context"): host._voice_context(false)
 		return
 	record["sensitivity_context"] = {"experiment_id":experiment.id,"candidate_id":block.candidate_id,"block_index":block.index}
 	record["training_context"] = {"kind":"sensitivity","cycle_id":experiment.id}
 	pending_record = record.duplicate(true)
 	await _submit_round()
+
+func hud_text(info: Dictionary) -> String:
+	var block := _block()
+	var remaining := maxf(0.0,float(info.get("remaining_s",0.0)))
+	var header := "Sensitivity %d/%d · Setting %s" % [_block_index()+1,experiment.get("blocks",[]).size(),labels.get(str(block.get("candidate_id","")),"?")]
+	var text: String
+	if warming:
+		text = "%s\nWARMUP · NOT SCORED\nScoring begins in %ds · targets reset then" % [header,int(ceil(remaining))]
+	else:
+		var duration := float(block.get("settings",{}).get("duration_s",20.0))
+		var phase := "SCORING STARTED" if remaining > duration - 2.0 else "SCORING"
+		var score := "%0.1f%% on target" % float(info.get("tracking_pct",0)) if str(info.get("drill","")) == "tracking" else "%d hits · %0.0f%% accuracy" % [int(info.get("hits",0)),float(info.get("accuracy",0))]
+		text = "%s\n%s · %ds left\n%s" % [header,phase,int(ceil(remaining)),score]
+	if str(info.get("drill","")) == "tracking": text += "\nHold left mouse while tracking"
+	return text + "\nEscape to pause · %d FPS" % Engine.get_frames_per_second()
 
 func _submit_round() -> void:
 	if busy or pending_record.is_empty() or not active: return

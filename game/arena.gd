@@ -301,7 +301,12 @@ func _fire_shot() -> void:
 	var error := _angular_error(target)
 	var hit := error <= float(target.get("radius", 0.0))
 	_shot_count += 1
-	_record["shots"].append({"t": _elapsed, "hit": hit, "target_id": target.get("id", ""), "error_deg": error})
+	var shot := {"t": _elapsed, "hit": hit, "target_id": target.get("id", ""), "error_deg": error}
+	if not target.is_empty():
+		# Capture the click itself: periodic samples cannot establish its exact position.
+		shot.merge({"aim_yaw": _yaw, "aim_pitch": _pitch, "target_yaw": target["yaw"],
+			"target_pitch": target["pitch"], "target_radius": target["radius"]})
+	_record["shots"].append(shot)
 	# Event-edge samples preserve the exact final correction before the target changes.
 	_capture_sample(0.0)
 	if hit:

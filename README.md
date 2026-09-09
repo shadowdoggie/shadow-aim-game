@@ -10,7 +10,7 @@ Download the archive for your system from [Releases](https://github.com/shadowdo
 
 Open **ChatGPT account** to sign in. Coaching uses your ChatGPT subscription through Codex. Your plan, remaining usage, and access to the requested models determine availability. There is no API-key billing fallback. Practice remains available without AI access.
 
-Start a guided baseline or choose **Precision clicking**, **Smooth tracking**, **Target switching**, or **Reactive tracking**. Reactive tracking adds unpredictable, reproducible direction changes and has its own benchmark history. Settings include sensitivity, DPI, field of view, target size, tracking speed, duration, and frame limit.
+The guided baseline measures **Precision clicking**, **Smooth tracking**, **Reactive tracking**, and **Target switching**. Afterward, the main **Practice** button follows saved coaching, resumes unfinished practice, and retests at the original difficulty. This progress survives restarts. Reactive tracking has its own artwork and benchmark history. All four modes also remain available for free practice.
 
 - **Left click:** shoot; hold while tracking.
 - **Escape:** pause. Resume preserves the round and excludes paused time.
@@ -19,9 +19,11 @@ Start a guided baseline or choose **Precision clicking**, **Smooth tracking**, *
 
 ## Coaching and voice
 
-Reviews use **Sol (`gpt-5.6-sol`) at high effort**. A targeted comparison favored Sol over Luna for interpreting the evidence correctly; see [the evaluation](docs/model-evaluation.md). Reviews use matching baselines, previous advice, and measured progress. They run between rounds, after a completed guided baseline, or when requested—not every frame. Practice blocks reuse their prescription before a retest.
+Reviews use **Sol (`gpt-5.6-sol`) at medium effort** with the same structured evidence checks. A targeted comparison favored Sol over Luna, and one live medium-effort progress check passed; these small checks do not establish consistently faster responses or general coaching quality. See [the evaluation](docs/model-evaluation.md). Reviews use matching baselines, previous advice, and measured progress. They run between rounds, after a completed guided baseline, or when requested—not every frame. Practice blocks reuse their prescription before a retest.
 
-Voice uses **GPT-Live (`gpt-live-1-codex`), full-duplex v3, and Juniper**. Microphone capture and speech playback run simultaneously. There is no older voice-mode or text-to-speech fallback. While connected, Juniper receives provisional aim measurements roughly every five seconds and saved round context. These updates do not each request a Sol analysis. Conversation and delegated tasks can consume additional subscription usage.
+Voice uses **GPT-Live (`gpt-live-1-codex`), full-duplex v3, and Juniper**. Microphone capture and speech playback run simultaneously. There is no older voice-mode or text-to-speech fallback. While connected, Juniper receives provisional aim measurements roughly every five seconds and saved round context. These updates do not each request a Sol analysis. App controls use a separate Luna/low backing thread; one live check applied volume and mix requests in about 2.7 seconds after speech, with network latency still variable. Conversation and delegated tasks can consume additional subscription usage.
+
+Accepted round reviews give a short spoken measurement summary while the detailed coach works. New clicking recordings include target-relative shot placement, center/edge percentages and directional bias. Older recordings remain explicitly unknown for these measurements.
 
 Voice starts off. **Talk with Juniper** enables the microphone; stopping voice ends capture and disconnects. Use headphones: this native integration does not provide acoustic echo cancellation. The voice, music, and game sliders are independently saved; Juniper can change them when asked.
 
@@ -29,7 +31,7 @@ This integration uses Codex app-server's experimental realtime interface. It che
 
 ## Music and sensitivity
 
-In **Music**, choose a folder. Shadow Aim indexes supported audio in its subfolders without following directory symlinks. Search and play locally, or ask Juniper for a song or artist. Ambiguous requests require a selection. Juniper reports success only after the game confirms the action. Music keeps playing across menus and rounds.
+In **Music**, choose a folder once. Shadow Aim saves it immediately, checkpoints unfinished scans, and resumes them after restart. Juniper gets current scan progress and partial search results. Mood, genre, or artist requests automatically choose a queue using music tags and folder labels; these are metadata matches, not audio classification. Next and automatic playback stay within that queue. Specific songs continue through related album, artist, or folder tracks; ambiguous song requests may need clarification. Juniper reports the actual track only after the game confirms playback. Music keeps playing across menus and rounds.
 
 **Find my sensitivity** compares your original setting with values 20% lower and higher, usually in 12 short rounds. Each has five unscored adaptation seconds and 20 measured seconds. Matched target seeds, reversed repeat order, accuracy, speed, and tracking measurements inform the comparison. Later comparable practice can revise an earlier result. No test silently changes your saved sensitivity; applying a suggestion is explicit. Saved comparisons reopen without another analysis request.
 

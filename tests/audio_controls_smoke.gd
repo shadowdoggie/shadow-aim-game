@@ -7,7 +7,7 @@ class MusicDouble:
 	var starts := 0
 	var fake_playing := false
 
-	func play_track(track: Dictionary, expires_at: float = 0.0) -> Dictionary:
+	func play_track(track: Dictionary, expires_at: float = 0.0, _queue: Array = [], _selection_label: String = "") -> Dictionary:
 		pending_generation += 1
 		var current := pending_generation
 		starts += 1

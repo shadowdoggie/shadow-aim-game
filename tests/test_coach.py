@@ -108,14 +108,14 @@ class ProtocolCoach(CodexCoach):
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_requests_exact_model_high_and_no_environments(self):
+    def test_requests_exact_model_medium_and_no_environments(self):
         coach = ProtocolCoach()
         self.assertEqual(coach.recommend(report()), recommendation())
         thread, turn = coach.sent
         self.assertEqual(thread[1]["model"], MODEL)
         self.assertFalse(thread[1]["allowProviderModelFallback"])
         self.assertEqual(turn[1]["model"], MODEL)
-        self.assertEqual(turn[1]["effort"], "high")
+        self.assertEqual(turn[1]["effort"], "medium")
         self.assertEqual(turn[1]["environments"], [])
         self.assertEqual(turn[1]["approvalPolicy"], "never")
         self.assertIn("outputSchema", turn[1])
@@ -127,8 +127,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(coach.sent), 1)
 
     def test_effort_substitution_fails_before_inference(self):
-        coach = ProtocolCoach(effort="medium")
-        with self.assertRaisesRegex(CoachError, "did not confirm gpt-5.6-sol with high effort"):
+        coach = ProtocolCoach(effort="high")
+        with self.assertRaisesRegex(CoachError, "did not confirm gpt-5.6-sol with medium effort"):
             coach.recommend(report())
         self.assertEqual(len(coach.sent), 1)
 
@@ -235,6 +235,9 @@ class FakeStorage:
 
     def list_sessions(self, limit=30):
         return [report()]
+
+    def baseline_history(self, limit=100):
+        return [item for item in self.list_sessions(limit) if item.get("training_context", {}).get("kind") == "baseline"]
 
     def save_coaching(self, identifier, value, question="", context=None):
         self.saved[identifier] = value
@@ -370,7 +373,7 @@ class HttpTests(unittest.TestCase):
         headers = {"Authorization": "Bearer " + self.token}
         status, result = self.request("GET", "/health", headers=headers)
         self.assertEqual(status, 200)
-        self.assertEqual((result["model"], result["effort"]), (MODEL, "high"))
+        self.assertEqual((result["model"], result["effort"]), (MODEL, "medium"))
         headers["Origin"] = "https://example.com"
         self.assertEqual(self.request("GET", "/health", headers=headers)[0], 401)
 

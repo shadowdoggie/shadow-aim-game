@@ -18,7 +18,7 @@ from .auth import AuthError, codex_launch_prefix
 
 LOG = logging.getLogger(__name__)
 MODEL = "gpt-5.6-sol"
-EFFORT = "high"
+EFFORT = "medium"
 DRILLS = ("clicking", "tracking", "switching")
 DECISIONS = ("progress", "consolidate", "change_focus", "diagnose", "collect_data")
 FOCUSES = ("flick_control", "click_timing", "tracking_control", "switching_speed", "measurement")

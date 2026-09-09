@@ -152,13 +152,68 @@ func run() -> void:
 	assert(not jitter._playback_waiting, "A complete reserve must restart playback")
 	assert(jitter._microphone == null, "Synthetic playback must not open a microphone")
 	jitter.stop()
+	# User onset clears buffered speech once. Fresh duplex audio must survive a
+	# delayed final transcript, with capture/upload and the user's gain unchanged.
+	var barge = ManualMixerVoice.new()
+	host.add_child(barge)
+	barge.setup(host)
+	barge.prepare_output()
+	barge._begin_audio()
+	barge._bridge_started = true
+	AudioServer.add_bus()
+	barge._speaker_bus = "VoiceSmokeBargeOutput"
+	AudioServer.set_bus_name(AudioServer.bus_count - 1, barge._speaker_bus)
+	barge.set_volume(1.3)
+	var speaker_volume := AudioServer.get_bus_volume_db(AudioServer.get_bus_index(barge._speaker_bus))
+	var speech_packet := pcm_packet(barge._playback_reserve_frames(),12000)
+	speech_packet.type = "audio"
+	barge._handle_event(speech_packet)
+	barge._play_output()
+	assert(barge._playback.get_frames_available() < barge._playback_capacity_frames,"The interruption fixture must contain buffered native speech")
+	barge._handle_event(speech_packet)
+	assert(barge._output_bytes > 0)
+	barge._events_completed(HTTPRequest.RESULT_SUCCESS,200,PackedStringArray(),JSON.stringify({"events":[{"seq":1,"type":"user_speech_started"}],"state":"connected"}).to_utf8_buffer())
+	assert(barge._user_speech_active and barge._output_bytes == 0 and barge._output_queue.is_empty(),"User speech must immediately clear queued Juniper output")
+	assert(barge._playback.get_frames_available() == barge._playback_capacity_frames,"User speech must flush the native generator too")
+	barge._handle_event(speech_packet)
+	barge._play_output()
+	var fresh_buffered: int = barge._playback_capacity_frames-barge._playback.get_frames_available()
+	assert(fresh_buffered > 0 and not barge._playback_waiting,"Fresh Juniper reply audio must play before a delayed user final transcript")
+	barge._handle_event({"type":"user_speech_started"})
+	assert(barge.get_audio_diagnostics().user_speech_interruptions == 1,"Repeated speech-start events must be idempotent")
+	barge._handle_event({"type":"transcript","role":"assistant","text":"Synthetic reply","final":false})
+	assert(barge._playback_capacity_frames-barge._playback.get_frames_available() == fresh_buffered,"Repeated user fragments and assistant transcripts must not clear a fresh reply")
+	barge._source_rate = 24000.0
+	barge._input_chunk.resize(barge.CHUNK_FRAMES * 2)
+	var microphone_fixture := PackedVector2Array()
+	microphone_fixture.resize(barge.CHUNK_FRAMES+1)
+	microphone_fixture.fill(Vector2.ONE*0.25)
+	barge._consume_capture(microphone_fixture)
+	barge._send_input()
+	assert(barge.uploads.size() == 1 and barge.is_active and barge.state == "connected","Synthetic microphone input must continue uploading during interruption")
+	assert(barge._microphone == null and barge.volume == 1.3 and AudioServer.get_bus_volume_db(AudioServer.get_bus_index(barge._speaker_bus)) == speaker_volume,"Interruption must not open a mic or change speaker gain")
+	barge._events_completed(HTTPRequest.RESULT_SUCCESS,200,PackedStringArray(),JSON.stringify({"events":[{"seq":2,"type":"user_speech_stopped"}],"state":"connected"}).to_utf8_buffer())
+	assert(not barge._user_speech_active and barge._playback_capacity_frames-barge._playback.get_frames_available() == fresh_buffered,"A delayed user final transcript must preserve the fresh reply already playing")
+	barge._handle_event({"type":"user_speech_stopped"})
+	assert(barge._playback_capacity_frames-barge._playback.get_frames_available() == fresh_buffered,"A repeated end event must not clear fresh audio")
+	barge._handle_event({"type":"user_speech_started"})
+	barge.stop()
+	assert(not barge._user_speech_active,"Session stop must reset interruption state")
+	barge._user_speech_active = true
+	barge.start()
+	assert(not barge._user_speech_active and barge.state == "connecting","A fresh session must not inherit an active user turn")
+	barge._user_speech_active = true
+	barge._handle_event({"type":"error","error":"Synthetic protocol error"})
+	assert(not barge._user_speech_active and barge.state == "error","Session errors must clear interruption state")
 	assert(not voice.is_active and voice.state == "off")
 	host.queue_free()
 	await create_timer(0.2).timeout
-	print("VOICE_AUDIO_SMOKE_PASS: phase continuity, ordered uploads, bursty playback without underruns, volume boost, mic off")
+	print("VOICE_AUDIO_SMOKE_PASS: phase continuity, ordered uploads, bursty playback without underruns, user onset flush once with fresh replies preserved during delayed final transcripts, continuous input, volume unchanged, mic off")
 	quit()
 
-func pcm_packet(frames: int) -> Dictionary:
+func pcm_packet(frames: int, sample_value: int = 0) -> Dictionary:
 	var bytes := PackedByteArray()
 	bytes.resize(frames * 2)
+	if sample_value != 0:
+		for i in frames: bytes.encode_s16(i*2,sample_value)
 	return {"audio":Marshalls.raw_to_base64(bytes),"sample_rate":24000,"num_channels":1}

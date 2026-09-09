@@ -160,13 +160,13 @@ class NativeMusicHTTPTests(unittest.TestCase):
     def music_state(self, state, identifier=None):
         self.eventually(lambda: self.server.music_state is not None and self.server.music_state["state"] == state
                         and (identifier is None or self.server.music_state["track"].get("id") == identifier))
-        self.assertFalse(set(self.server.music_state["track"]) - {"id", "title", "artist", "album"})
+        self.assertFalse(set(self.server.music_state["track"]) - {"id", "title", "artist", "album", "genre", "mood"})
 
     def test_music_and_saved_audio_through_actual_native_acknowledgements(self):
         folder = self.base / "generated-music"
-        nested = folder / "nested"
+        nested = folder / "Ambient"
         nested.mkdir(parents=True)
-        for path in (folder / "Fixture Alpha.wav", nested / "Fixture Beta.wav"):
+        for path in (nested / "Fixture Alpha.wav", nested / "Fixture Beta.wav", folder / "Unrelated rock.wav"):
             with wave.open(str(path), "wb") as stream:
                 stream.setnchannels(1)
                 stream.setsampwidth(2)
@@ -175,9 +175,9 @@ class NativeMusicHTTPTests(unittest.TestCase):
         self.http("/music/folder", {"path": str(folder)})
         self.eventually(lambda: self.server.music.status()["status"] == "ready")
         listing = self.http("/music")
-        self.assertEqual(listing["total"], 2)
+        self.assertEqual(listing["total"], 3)
         alpha = self.http("/music/search?q=" + quote("Fixture Alpha"))["tracks"][0]
-        beta = next(track for track in listing["tracks"] if track["id"] != alpha["id"])
+        beta = next(track for track in listing["tracks"] if track["title"] == "Fixture Beta")
         self.start_native()
         # Coach remains connecting throughout: native controls must already work.
         self.assertEqual(self.server.jobs.coach.state, "connecting")
@@ -190,6 +190,14 @@ class NativeMusicHTTPTests(unittest.TestCase):
         self.music_action("stop")
         self.music_state("stopped")
         self.music_action("play", track_id=beta["id"])
+        self.music_state("playing", beta["id"])
+        self.music_action("next")
+        self.music_state("playing", alpha["id"])
+        self.music_action("play", mix="relaxing")
+        self.music_state("playing", alpha["id"])
+        self.assertEqual(self.server.music_state["selection_label"], "Relaxing music")
+        self.assertEqual(self.server.music_state["queue_count"], 2)
+        self.music_action("next")
         self.music_state("playing", beta["id"])
         self.music_action("next")
         self.music_state("playing", alpha["id"])
@@ -225,7 +233,7 @@ class NativeMusicHTTPTests(unittest.TestCase):
         self.start_server()
         self.start_native()
         self.eventually(lambda: self.server.audio_state == expected)
-        self.assertEqual(self.http("/music")["total"], 2, "The selected library must persist across restart")
+        self.assertEqual(self.http("/music")["total"], 3, "The selected library must persist across restart")
         self.music_state("stopped")
         self.close_native()
         self.assertIn("NATIVE_MUSIC_HTTP_PASS", (self.base / "native.log").read_text())

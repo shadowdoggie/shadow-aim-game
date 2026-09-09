@@ -26,6 +26,14 @@ func _draw() -> void:
 			wave.append(Vector2(mid.x-110+i*3.2, mid.y+sin(i*.095)*22))
 		draw_polyline(wave, Color("435f53"), 2, true)
 		locations = [wave[48]]
+	if mode == "reactive":
+		var turns := PackedVector2Array([
+			mid+Vector2(-112,22),mid+Vector2(-78,-19),mid+Vector2(-41,-9),
+			mid+Vector2(-12,27),mid+Vector2(20,-25),mid+Vector2(58,8),mid+Vector2(106,-13)])
+		draw_polyline(turns,Color("435f53"),2,true)
+		for index in [1,3,4]:
+			draw_circle(turns[index],3,Color("628051"))
+		locations = [turns[5]]
 	if mode == "switching":
 		draw_line(locations[0], locations[1], Color("435f53"), 1, true)
 		draw_line(locations[1], locations[2], Color("435f53"), 1, true)
@@ -33,4 +41,4 @@ func _draw() -> void:
 		var p := locations[i]
 		draw_circle(p, 18, Color("283a32"))
 		draw_arc(p, 18, 0, TAU, 40, GREEN, 1.3, true)
-		draw_circle(p, 5 if mode != "tracking" else 8, GREEN)
+		draw_circle(p, 8 if mode in ["tracking","reactive"] else 5, GREEN)

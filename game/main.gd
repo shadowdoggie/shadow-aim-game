@@ -7,6 +7,7 @@ const VoiceCoach = preload("res://game/voice_coach.gd")
 const PausePanel = preload("res://game/pause_panel.gd")
 const MusicPanel = preload("res://game/music_panel.gd")
 const AccountPanel = preload("res://game/account_panel.gd")
+const TrainingFlow = preload("res://game/training_flow.gd")
 const INK = Color("0c1115")
 const PANEL = Color("151e23")
 const LINE = Color("2b383e")
@@ -24,6 +25,9 @@ var hud: Label
 var notice: Label
 var job_id := ""
 var job_record_id := ""
+const COACH_POLL_SECONDS := 0.5
+var review_started_ms := 0
+var review_generation := 0
 var poll_elapsed := 0.0
 var polling := false
 var is_playing := false
@@ -33,6 +37,7 @@ var last_report: Dictionary = {}
 var comparison: Dictionary = {}
 var recommendation: Dictionary = {}
 var pending_rounds: Array = []
+var baseline_round_total := 4
 var benchmarks: Dictionary = {}
 var benchmark_reports: Dictionary = {}
 var guided := false
@@ -63,6 +68,7 @@ var music_volume := 0.5
 var game_volume := 1.0
 var music: Node
 var account: Node
+var training: Node
 var controls_elapsed := 0.0
 var controls_polling := false
 var controls_after := 0
@@ -142,6 +148,9 @@ func _ready() -> void:
 	account = AccountPanel.new()
 	add_child(account)
 	account.setup(self)
+	training = TrainingFlow.new()
+	add_child(training)
+	training.setup(self)
 	pause_menu = PausePanel.new()
 	add_child(pause_menu)
 	pause_menu.setup(self)
@@ -345,13 +354,11 @@ func _home() -> void:
 	var actions := HBoxContainer.new()
 	actions.add_theme_constant_override("separation", 12)
 	left.add_child(actions)
-	_button(actions, "Start guided baseline  →", _start_baseline, true)
-	_label(left, "3 short rounds  ·  About 3 minutes", 15, MUTED)
+	training.add_home_action(actions,left)
 	_button(left, "Find my sensitivity  →", sensitivity.show_intro)
 	var right := _card(hero)
 	_label(right, "YOUR NEXT STEP", 14, LIME)
-	_label(right, "01  Establish your baseline", 25)
-	_paragraph(right, "A little clicking, tracking, and switching. Your coach looks for a specific, measurable place to start.")
+	training.add_home_summary(right)
 	_gap(right, 12)
 	for item in ["01   Measure your aim", "02   Get one useful adjustment", "03   Practice, then retest"]:
 		_label(right, item, 19)
@@ -381,6 +388,9 @@ func _home() -> void:
 			pending_rounds.clear()
 			_begin_round(drill, settings.duplicate(true)), false)
 	var reactive := _card(drills)
+	var reactive_diagram := Diagram.new()
+	reactive_diagram.mode = "reactive"
+	reactive.add_child(reactive_diagram)
 	_label(reactive,"Reactive tracking",23)
 	_paragraph(reactive,"Stay on a target that changes direction. React and settle back on it.",16)
 	_button(reactive,"Practice  ·  %ds" % settings.duration_s,func():
@@ -391,21 +401,27 @@ func _home() -> void:
 		config.tracking_motion = "reactive"
 		_begin_round("tracking",config))
 	_label(body, "Native practice. Local history. One clear next step.", 14, MUTED)
+	training.refresh()
 
-func _start_baseline() -> void:
+func _start_baseline(modes: Array = [], resume_cycle_id: String = "") -> void:
 	guided = true
 	stage = "baseline"
-	cycle_id = _new_cycle_id()
+	cycle_id = resume_cycle_id if not resume_cycle_id.is_empty() else _new_cycle_id()
 	source_coaching_record_id = ""
 	benchmarks.clear()
 	benchmark_reports.clear()
 	pending_rounds.clear()
-	for drill in DRILLS:
+	var selected: Array = modes if not modes.is_empty() else ["clicking","tracking","reactive_tracking","switching"]
+	for mode in selected:
+		if mode not in ["clicking","tracking","reactive_tracking","switching"]: continue
+		var drill: String = "tracking" if mode == "reactive_tracking" else str(mode)
 		var config: Dictionary = settings.duplicate(true)
 		config.duration_s = 45.0
 		config.target_scale = 1.0
 		config.speed_scale = 1.0
+		if drill == "tracking": config.tracking_motion = "reactive" if mode == "reactive_tracking" else "smooth"
 		pending_rounds.append({"drill":drill,"settings":config})
+	baseline_round_total = pending_rounds.size()
 	_next_round()
 
 func _next_round() -> void:
@@ -427,7 +443,8 @@ func _begin_round(drill: String, config: Dictionary) -> void:
 	if cycle_id.is_empty() or stage == "free": cycle_id = _new_cycle_id()
 	active_training_context = {"kind":"baseline" if stage == "prepractice_baseline" else stage,"cycle_id":cycle_id}
 	if stage in ["practice","retest"]:
-		if benchmarks.has(drill): active_training_context.baseline_record_id = str(benchmarks[drill].id)
+		var key := TrainingFlow.mode_key(drill,config)
+		if benchmarks.has(key): active_training_context.baseline_record_id = str(benchmarks[key].id)
 		if not source_coaching_record_id.is_empty(): active_training_context.source_coaching_record_id = source_coaching_record_id
 	_voice_context()
 	page.hide()
@@ -437,7 +454,7 @@ func _begin_round(drill: String, config: Dictionary) -> void:
 	var generation := countdown_generation
 	for n in [3,2,1]:
 		var stage_label: String = {"prepractice_baseline":"Baseline","free":"Free practice"}.get(stage,stage.capitalize())
-		if stage == "baseline": stage_label = "Baseline %d/3" % (3-pending_rounds.size())
+		if stage == "baseline": stage_label = "Baseline %d/%d" % [baseline_round_total-pending_rounds.size(),baseline_round_total]
 		if stage == "sensitivity": stage_label = sensitivity.progress_text
 		hud.text = "%s  ·  %s\n%s\nStarting in %d" % [_drill_title(drill,config), stage_label, "Hold left mouse on the moving target" if drill == "tracking" else "Click the bright target", n]
 		await get_tree().create_timer(0.65).timeout
@@ -502,7 +519,7 @@ func _hud_updated(info: Dictionary) -> void:
 	hud.text = "%s  ·  %0.0fs  ·  %s\n%s  ·  %d FPS" % ["REPLAY" if is_replaying else _drill_title(str(info.get("drill","clicking")),last_record.get("settings",{}) if is_replaying else current_round_settings), float(info.get("remaining_s",0)), score_text, "Escape to return" if is_replaying else "Escape to pause", Engine.get_frames_per_second()]
 	if tracking and not is_replaying: hud.text += "\nHold left mouse while tracking"
 	if is_replaying: hud.text += "\nGold trail = your recent aim movement"
-	if sensitivity.active: hud.text = sensitivity.progress_text + "\n" + hud.text
+	if sensitivity.active: hud.text = sensitivity.hud_text(info)
 	if voice.is_active: hud.text += "\nJuniper live · mic on · V to mute"
 	elif voice.state == "error": hud.text += "\nVoice disconnected · V to reconnect"
 
@@ -522,18 +539,21 @@ func _round_finished(record: Dictionary) -> void:
 		pending_rounds.clear()
 		_home()
 		return
-	if stage in ["baseline","prepractice_baseline"]: benchmarks[record.drill] = record.duplicate(true)
+	var benchmark_mode := TrainingFlow.mode_key(str(record.drill),record.get("settings",{}))
+	if stage in ["baseline","prepractice_baseline"]: benchmarks[benchmark_mode] = record.duplicate(true)
 	_results("Saving your round…")
 	var response: Dictionary = await _api("/sessions", HTTPClient.METHOD_POST, record)
 	if str(last_record.get("id","")) != str(record.id): return
 	if response.has("report"):
 		last_report = response.report
 		comparison = response.get("comparison",{}) if response.get("comparison") is Dictionary else {}
-		if stage in ["baseline","prepractice_baseline"]: benchmark_reports[record.drill] = last_report.duplicate(true)
+		if stage in ["baseline","prepractice_baseline"]: benchmark_reports[benchmark_mode] = last_report.duplicate(true)
 		if screen == "results" and not is_playing and not is_replaying:
 			_results()
 			_voice_context()
-			if pending_rounds.is_empty() and stage not in ["practice","prepractice_baseline"]: _request_coaching()
+			if pending_rounds.is_empty() and stage not in ["practice","prepractice_baseline"]:
+				if stage == "baseline": training.review_completed_baseline()
+				else: _request_coaching()
 	else:
 		push_warning("Round save failed (%s): %s" % [str(record.id),str(response.get("error","Unknown local companion error"))])
 		DirAccess.make_dir_recursive_absolute("user://pending")
@@ -546,7 +566,7 @@ func _results(message: String = "") -> void:
 	screen = "results"
 	var body := _clear_page()
 	_label(body, "ROUND COMPLETE  /  " + _drill_title(str(last_record.get("drill", "")),last_record.get("settings",{})).to_upper(), 14, LIME)
-	_label(body, "Baseline %d of 3 complete." % (3-pending_rounds.size()) if stage == "baseline" else "Your round, measured.", 46)
+	_label(body, "Baseline %d of %d complete." % [baseline_round_total-pending_rounds.size(),baseline_round_total] if stage == "baseline" else "Your round, measured.", 46)
 	if not message.is_empty(): _paragraph(body,message,18,LIME)
 	var stats := HBoxContainer.new()
 	stats.add_theme_constant_override("separation",14)
@@ -582,7 +602,7 @@ func _results(message: String = "") -> void:
 		_paragraph(coach_box,"Saving your measurements before the next step…")
 	elif not pending_rounds.is_empty():
 		_label(coach_box,"Next: " + _drill_title(str(pending_rounds[0].drill),pending_rounds[0].get("settings",{})),25)
-		_paragraph(coach_box,"Coaching starts after round 3. Each round measures a different part of your aim." if stage == "baseline" else "Repeat the same cue once more before retesting.")
+		_paragraph(coach_box,"Coaching starts after the baseline. Each round measures a different part of your aim." if stage == "baseline" else "Repeat the same cue once more before retesting.")
 		_button(coach_box,"Next round  →",_next_round,true)
 	elif stage == "practice":
 		_label(coach_box,"Now check what changed.",25)
@@ -592,7 +612,7 @@ func _results(message: String = "") -> void:
 		_render_coach(coach_box)
 	else:
 		var waiting := not job_id.is_empty() or submitting_coach
-		job_hint = _paragraph(coach_box,coach_message if not coach_message.is_empty() else ("Your coach is reviewing your rounds. Juniper will tell you when it is ready." if waiting and voice.is_active else "Your coach is reviewing your rounds…" if waiting else "Your measurements are ready for review."))
+		job_hint = _paragraph(coach_box,coach_message if not coach_message.is_empty() else (_review_status_text() if waiting else "Your measurements are ready for review."))
 		if waiting:
 			if not job_id.is_empty(): _button(coach_box,"Cancel review",_cancel_coaching)
 		else: _button(coach_box,"Request coaching",_request_coaching)
@@ -628,7 +648,7 @@ func _render_coach(parent: VBoxContainer) -> void:
 	_label(parent,"Juniper has your review.",25)
 	_button(parent,"Hear coaching",func(): _hear_coaching({"coaching":recommendation}),true)
 	var drill: String = str(recommendation.get("drill",last_record.get("drill","clicking")))
-	_label(parent,"Next: " + _drill_title(drill,benchmarks.get(drill,{}).get("settings",last_record.get("settings",{}))),19)
+	_label(parent,"Next: " + _drill_title(drill,benchmarks.get(_recommended_benchmark_key(drill),{}).get("settings",last_record.get("settings",{}))),19)
 	_button(parent,"Start coached practice  →",_practice_prescription)
 	var cited_rounds: Array = []
 	for evidence_id in recommendation.get("evidence_ids",[]):
@@ -646,23 +666,36 @@ func _hear_coaching(extra: Dictionary) -> void:
 	await _voice_context(false,extra)
 	if wants_voice_advice and voice.state != "connecting": voice.start()
 
+func _recommended_benchmark_key(drill: String) -> String:
+	# Advice can cite either tracking mode; preserve the mode of its evidence.
+	for evidence_id in recommendation.get("evidence_ids",[]):
+		var record_id: String = str(evidence_id).get_slice(":",0)
+		for key in benchmarks:
+			var record: Dictionary = benchmarks[key]
+			if record.get("drill","") == drill and str(record.get("id","")) == record_id: return str(key)
+	if last_record.get("drill","") == drill:
+		return TrainingFlow.mode_key(drill,last_record.get("settings",{}))
+	return drill
+
 func _practice_prescription() -> void:
 	stage = "practice"
 	cycle_id = _new_cycle_id()
 	source_coaching_record_id = recommendation_record_id
 	var drill: String = recommendation.get("drill",last_record.get("drill","clicking"))
-	if last_record.get("drill") == drill:
-		benchmarks[drill] = last_record.duplicate(true)
-		benchmark_reports[drill] = last_report.duplicate(true)
-	if not benchmarks.has(drill):
+	var key := _recommended_benchmark_key(drill)
+	if last_record.get("drill") == drill and TrainingFlow.mode_key(drill,last_record.get("settings",{})) == key:
+		benchmarks[key] = last_record.duplicate(true)
+		benchmark_reports[key] = last_report.duplicate(true)
+	if not benchmarks.has(key):
 		stage = "prepractice_baseline"
 		var baseline_config: Dictionary = settings.duplicate(true)
 		baseline_config.duration_s = 45.0
 		baseline_config.target_scale = 1.0
 		baseline_config.speed_scale = 1.0
+		if drill == "tracking": baseline_config.tracking_motion = "reactive" if key == "reactive_tracking" else "smooth"
 		_begin_round(drill,baseline_config)
 		return
-	var config: Dictionary = benchmarks[drill].settings.duplicate(true)
+	var config: Dictionary = benchmarks[key].settings.duplicate(true)
 	config.merge(recommendation.get("parameters",{}),true)
 	pending_rounds.clear()
 	for i in range(2): pending_rounds.append({"drill":drill,"settings":config.duplicate(true)})
@@ -672,7 +705,8 @@ func _retest() -> void:
 	stage = "retest"
 	var drill: String = recommendation.get("drill",last_record.get("drill","clicking"))
 	var config: Dictionary = settings.duplicate(true)
-	if benchmarks.has(drill): config = benchmarks[drill].settings.duplicate(true)
+	var key := _recommended_benchmark_key(drill)
+	if benchmarks.has(key): config = benchmarks[key].settings.duplicate(true)
 	config.erase("seed")
 	_begin_round(drill,config)
 
@@ -888,27 +922,47 @@ func _api(path: String, method: int = HTTPClient.METHOD_GET, payload: Dictionary
 
 func _request_coaching(question: String = "") -> void:
 	if not job_id.is_empty() or last_report.is_empty() or submitting_coach: return
+	review_generation += 1
+	var generation := review_generation
+	var requested_record := str(last_record.id)
+	job_record_id = requested_record
+	review_started_ms = Time.get_ticks_msec()
 	submitting_coach = true
 	coach_message = ""
 	recommendation.clear()
 	if screen == "results": _results()
-	job_record_id = str(last_record.id)
-	var response: Dictionary = await _api("/coach",HTTPClient.METHOD_POST,{"record_id":job_record_id,"question":question})
+	var response: Dictionary = await _api("/coach",HTTPClient.METHOD_POST,{"record_id":requested_record,"question":question})
+	if generation != review_generation or requested_record != str(last_record.get("id","")):
+		if generation == review_generation: submitting_coach = false
+		if response.has("job_id"): await _api("/jobs/"+str(response.job_id)+"/cancel",HTTPClient.METHOD_POST)
+		return
 	submitting_coach = false
 	if response.has("job_id"):
 		job_id = str(response.job_id)
-		poll_elapsed = 2.0
+		poll_elapsed = COACH_POLL_SECONDS
 		if screen == "results" and not is_playing and not is_replaying: _results()
+		if voice.is_active and screen == "results" and not is_playing and not is_replaying:
+			_voice_context(true,{"record_id":requested_record,"review_pending_job_id":job_id})
 	elif screen == "results":
 		coach_message = "Coach unavailable: " + str(response.get("error","Please try again."))
 		_results()
 
+func _review_status_text() -> String:
+	var seconds := maxi(0,int((Time.get_ticks_msec()-review_started_ms)/1000))
+	var text := "Review in progress · %ds · your round is saved" % seconds
+	if seconds >= 30: text += "\nStill reviewing. You can replay or keep practising while it finishes."
+	elif is_instance_valid(voice) and voice.is_active: text += "\nJuniper will speak when the review is ready."
+	return text
+
 func _cancel_coaching() -> void:
 	if job_id.is_empty(): return
-	await _api("/jobs/" + job_id + "/cancel",HTTPClient.METHOD_POST)
+	var cancelled_job := job_id
+	review_generation += 1
 	job_id = ""
 	coach_message = "Review cancelled. Your round is saved."
 	if screen == "results" and not is_playing: _results()
+	await _api("/jobs/" + cancelled_job + "/cancel",HTTPClient.METHOD_POST)
+	_voice_context()
 
 func _process(delta: float) -> void:
 	controls_elapsed += delta
@@ -920,18 +974,22 @@ func _process(delta: float) -> void:
 		if live_elapsed >= 5.0 and not sending_live:
 			live_elapsed = 0.0
 			_send_live_measurements()
+	if (not job_id.is_empty() or submitting_coach) and screen == "results" and is_instance_valid(job_hint):
+		job_hint.text = _review_status_text()
 	if job_id.is_empty() or polling: return
 	poll_elapsed += delta
-	if poll_elapsed < 2.0: return
+	if poll_elapsed < COACH_POLL_SECONDS: return
 	poll_elapsed = 0
 	poll_job()
 
 func poll_job() -> void:
+	if job_id.is_empty(): return
 	polling = true
 	var current := job_id
+	var generation := review_generation
 	var response := await _api("/jobs/" + current)
 	polling = false
-	if current != job_id: return
+	if current != job_id or generation != review_generation: return
 	var status: String = str(response.get("status",""))
 	if status == "complete":
 		job_id = ""
@@ -1004,13 +1062,16 @@ func _apply_control(action: Dictionary) -> void:
 			result = {"status":"completed","value":_audio_levels()[channel]} if last_settings_save_error.is_empty() else {"status":"failed","error":last_settings_save_error,"value":_audio_levels()[channel]}
 	elif str(action.get("type","")) == "music":
 		var playback: Dictionary = {}
+		var previous_track_id := str(music.current_track.get("id",""))
 		match str(action.get("action","")):
-			"play": playback = await music.play_track(action.get("track",{}),float(action.get("expires_at",0)))
+			"play": playback = await music.play_track(action.get("track",{}),float(action.get("expires_at",0)),action.get("queue",[]),str(action.get("selection_label","")))
 			"pause": playback = music.pause_music()
 			"resume": playback = music.resume_music()
 			"stop": playback = music.stop_music()
 			"next": playback = await music.next_track(float(action.get("expires_at",0)))
-		if playback.get("ok",false): result = {"status":"completed","message":"Music " + str(playback.get("state","playing")) + "."}
+		if playback.get("ok",false):
+			var actual_track: Dictionary = music.get_state().get("track",{})
+			result = {"status":"completed","message":"Music " + str(playback.get("state","playing")) + ".","track":actual_track,"changed_track":not actual_track.is_empty() and str(actual_track.get("id","")) != previous_track_id}
 		else: result = {"status":"failed","error":str(playback.get("error","Music command failed."))}
 	var ack_path := "/controls/"+str(action.get("id",""))+"/ack"
 	for attempt in range(2):

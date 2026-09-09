@@ -14,6 +14,8 @@ var state := "stopped"
 var current_track: Dictionary = {}
 var library: Dictionary = {}
 var tracks: Array = []
+var play_queue: Array = []
+var selection_label := ""
 var message := ""
 var query := ""
 var _picker: FileDialog
@@ -30,6 +32,7 @@ var _poll_elapsed := 0.0
 var _owns_bus := false
 var _load_tasks: Array[int] = []
 var _state_revision := 0
+var _preparing := false
 
 func setup(owner_node: Node) -> void:
 	host = owner_node
@@ -175,7 +178,7 @@ func _render_tracks() -> void:
 		_track_list.add_child(row)
 		var label: Label = host._paragraph(row,_track_title(track),18,TEXT)
 		label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		host._button(row,"Play",func(): play_track(track))
+		host._button(row,"Play",func(): play_track(track,0.0,tracks,query))
 	if query.is_empty() and int(library.get("total",tracks.size())) > tracks.size():
 		host._paragraph(_track_list,"Showing the first %d songs. Search to find more." % tracks.size(),14)
 
@@ -192,12 +195,15 @@ func _update_library_ui() -> void:
 	else:
 		_library_hint.text = "%d songs · %s" % [int(library.get("total",0)),folder]
 
-func play_track(track: Dictionary, expires_at: float = 0.0) -> Dictionary:
+func play_track(track: Dictionary, expires_at: float = 0.0, queue: Array = [], label: String = "") -> Dictionary:
 	var id: String = str(track.get("id",""))
 	if id.is_empty(): return {"ok":false,"error":"Choose a song from your indexed music folder."}
 	if _request_expired(expires_at): return {"ok":false,"error":"The music request expired before playback started."}
+	var previous_id: String = str(current_track.get("id",""))
+	var next_queue := _make_queue(track,queue)
 	_generation += 1
 	var generation := _generation
+	_preparing = true
 	message = "Loading " + _track_title(track) + "…"
 	_update_playback_ui()
 	var response: Dictionary = await _prepare_track(id)
@@ -224,12 +230,30 @@ func play_track(track: Dictionary, expires_at: float = 0.0) -> Dictionary:
 	player.stop()
 	player.stream = stream
 	player.stream_paused = false
-	current_track = response.get("track",track).duplicate(true)
 	player.play()
+	if not player.playing:
+		state = "stopped"
+		return _playback_error("This song could not start playing. Please try another song.")
+	current_track = response.get("track",track).duplicate(true)
+	play_queue = next_queue
+	selection_label = label.strip_edges()
+	_preparing = false
 	state = "playing"
 	message = ""
 	_publish_state()
-	return {"ok":true,"track":current_track,"state":state}
+	return {"ok":true,"track":get_state().track,"state":state,"changed_track":previous_id != str(current_track.get("id",""))}
+
+func _make_queue(track: Dictionary, selection: Array) -> Array:
+	var result: Array = []
+	var ids := {}
+	for item in selection:
+		if not item is Dictionary: continue
+		var id: String = str(item.get("id",""))
+		if id.is_empty() or ids.has(id): continue
+		ids[id] = true
+		result.append(item.duplicate(true))
+	if not ids.has(str(track.get("id",""))): result.push_front(track.duplicate(true))
+	return result
 
 func _request_expired(expires_at: float) -> bool:
 	return expires_at > 0.0 and Time.get_unix_time_from_system() >= expires_at
@@ -274,6 +298,7 @@ func resume_music() -> Dictionary:
 
 func stop_music() -> Dictionary:
 	_generation += 1
+	_preparing = false
 	player.stop()
 	player.stream_paused = false
 	state = "stopped"
@@ -282,14 +307,18 @@ func stop_music() -> Dictionary:
 	return {"ok":true,"state":state}
 
 func next_track(expires_at: float = 0.0) -> Dictionary:
-	if tracks.is_empty(): await _refresh_library()
-	if tracks.is_empty(): return {"ok":false,"error":"Choose a music folder and a song first."}
+	return await _advance_queue(expires_at,false)
+
+func _advance_queue(expires_at: float, repeat_single: bool) -> Dictionary:
+	if play_queue.is_empty(): return {"ok":false,"error":"Choose a song or a music selection first."}
+	if play_queue.size() == 1 and not repeat_single:
+		return {"ok":false,"error":"This selection has only one song. Choose another song or a broader selection."}
 	var index := -1
-	for i in tracks.size():
-		if str(tracks[i].get("id","")) == str(current_track.get("id","")):
+	for i in play_queue.size():
+		if str(play_queue[i].get("id","")) == str(current_track.get("id","")):
 			index = i
 			break
-	return await play_track(tracks[(index+1) % tracks.size()],expires_at)
+	return await play_track(play_queue[(index+1) % play_queue.size()],expires_at,play_queue,selection_label)
 
 func is_playing() -> bool:
 	return is_instance_valid(player) and player.playing and not player.stream_paused
@@ -309,7 +338,7 @@ func get_state() -> Dictionary:
 	var track: Dictionary = {}
 	for key in ["id","title","artist","album"]:
 		if current_track.has(key): track[key] = str(current_track[key])
-	return {"state":state,"track":track,"playing":is_playing(),"paused":is_paused(),"position_s":player.get_playback_position() if is_instance_valid(player) else 0.0,"volume":volume,"revision":_state_revision}
+	return {"state":state,"track":track,"playing":is_playing(),"paused":is_paused(),"position_s":player.get_playback_position() if is_instance_valid(player) else 0.0,"volume":volume,"revision":_state_revision,"selection_label":selection_label,"queue_count":play_queue.size()}
 
 func _track_title(track: Dictionary) -> String:
 	var title: String = str(track.get("title","Song"))
@@ -317,6 +346,7 @@ func _track_title(track: Dictionary) -> String:
 	return title + " · " + artist if not artist.is_empty() else title
 
 func _playback_error(detail: String) -> Dictionary:
+	_preparing = false
 	message = detail
 	push_warning("Music playback failed: " + detail)
 	_publish_state()
@@ -334,6 +364,8 @@ func _update_playback_ui() -> void:
 		_now_playing.text = _track_title(current_track) if not current_track.is_empty() else "Pick something you want to hear."
 	if is_instance_valid(_playback_hint):
 		_playback_hint.text = message if not message.is_empty() else {"playing":"Playing · continues during practice","paused":"Paused","stopped":"Stopped"}.get(state,state)
+		if message.is_empty() and not selection_label.is_empty():
+			_playback_hint.text += " · " + selection_label
 	if is_instance_valid(_pause_button):
 		_pause_button.text = "Resume" if is_paused() else "Pause"
 		_pause_button.disabled = not is_playing() and not is_paused()
@@ -341,6 +373,9 @@ func _update_playback_ui() -> void:
 func _track_finished() -> void:
 	state = "stopped"
 	_publish_state()
+	# An explicit Play may already be preparing the next selection while the
+	# old song ends. Let that request finish instead of replacing it.
+	if not _preparing and not play_queue.is_empty(): await _advance_queue(0.0,true)
 
 func _process(delta: float) -> void:
 	if str(library.get("status","")) != "scanning": return

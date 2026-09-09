@@ -194,6 +194,15 @@ class Storage:
             ).fetchall()
         return [self._summary(json.loads(row["report_json"]), bool(row["coached"])) for row in rows]
 
+    def baseline_history(self, limit: int = 100) -> list[dict]:
+        """Read baseline reports even after ordinary rounds fill recent history."""
+        limit = self._limit(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT report_json FROM sessions WHERE json_extract(report_json, '$.training_context.kind') = 'baseline' "
+                "ORDER BY started_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
+        return [json.loads(row["report_json"]) for row in rows]
+
     def get_session(self, record_id: str) -> dict:
         record_id = validate_id(record_id)
         with self._connect() as connection:

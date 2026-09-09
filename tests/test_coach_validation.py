@@ -180,7 +180,7 @@ class ContextProtocolTests(unittest.TestCase):
         self.assertEqual(request["prior_goal_evaluation"]["status"], "met")
         self.assertEqual(result, advice())
         self.assertEqual(coach.sent[1][1]["model"], MODEL)
-        self.assertEqual(coach.sent[1][1]["effort"], "high")
+        self.assertEqual(coach.sent[1][1]["effort"], "medium")
 
 
 def sensitivity_analysis():

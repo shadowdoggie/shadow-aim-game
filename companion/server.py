@@ -22,7 +22,7 @@ from .auth import AppAuth, AuthError, shared_codex_env
 from .metrics import DRILLS, analyze_record, canonicalize_json, validate_id
 from .sensitivity import add_follow_up, add_result, analyze_experiment, create_experiment
 from .storage import Storage
-from .training import benchmark_comparison, coaching_context, contextual_history
+from .training import benchmark_comparison, coaching_context, contextual_history, next_training_action
 from .voice_bridge import VoiceBridge, VoiceError
 
 LOG = logging.getLogger(__name__)
@@ -238,8 +238,27 @@ class NativeControls:
                 if not isinstance(result[key], str) or len(result[key]) > 500:
                     raise ValueError("Invalid game action acknowledgement.")
                 response[key] = result[key]
+        if "track" in result:
+            track = result["track"]
+            if not isinstance(track, dict) or set(track) - {"id", "title", "artist", "album", "genre", "mood"}:
+                raise ValueError("Invalid applied music track.")
+            if any(not isinstance(v, str) or len(v) > 500 for v in track.values()):
+                raise ValueError("Invalid applied music metadata.")
+            if track.get("id"):
+                validate_id(track["id"])
+            response["track"] = copy.deepcopy(track)
+        if "changed_track" in result:
+            if not isinstance(result["changed_track"], bool):
+                raise ValueError("Invalid music switch acknowledgement.")
+            response["changed_track"] = result["changed_track"]
         with self._lock:
             entry = self._actions[identifier]
+            if response["status"] == "completed" and entry["action"].get("type") == "music" and entry["action"].get("action") in {"play", "next"}:
+                if not response.get("track", {}).get("id") or (entry["action"]["action"] == "next" and not response.get("changed_track")):
+                    response.update(status="failed", error="The game did not confirm a different playing song." if entry["action"]["action"] == "next" else "The game did not confirm which song started.")
+                elif entry["action"]["action"] == "play" and response["track"]["id"] != entry["action"].get("track", {}).get("id"):
+                    response.update(status="failed", error="The game is playing a different song from the requested selection.")
+            response["confirmed_at_unix_s"] = time.time()
             if entry["result"] is None and entry["action"]["expires_at"] > time.time():
                 entry["result"] = response
                 entry["event"].set()
@@ -266,6 +285,7 @@ class CompanionServer(ThreadingHTTPServer):
         self.volume_lock = threading.Lock()
         self.account_lock = threading.RLock()
         self.voice_context = {}
+        self._review_notices = set()
         self.audio_state = None
         self.audio_revision = None
         self.music_state = None
@@ -372,8 +392,12 @@ class CompanionServer(ThreadingHTTPServer):
     def set_music_state(self, value):
         value = canonicalize_json(value)
         expected = {"state", "track", "playing", "paused", "position_s", "volume", "revision"}
-        if set(value) != expected or not isinstance(value["state"], str) or value["state"] not in {"playing", "paused", "stopped"}:
+        if (not expected <= set(value) or set(value) - expected - {"selection_label", "queue_count"}) or not isinstance(value["state"], str) or value["state"] not in {"playing", "paused", "stopped"}:
             raise ValueError("Invalid native music state.")
+        if "selection_label" in value and (not isinstance(value["selection_label"], str) or len(value["selection_label"]) > 200):
+            raise ValueError("Invalid music selection label.")
+        if "queue_count" in value and (type(value["queue_count"]) is not int or not 0 <= value["queue_count"] <= 100):
+            raise ValueError("Invalid music queue size.")
         if type(value["revision"]) is not int or value["revision"] < 0:
             raise ValueError("Music state revision must be a nonnegative integer.")
         if not isinstance(value["playing"], bool) or not isinstance(value["paused"], bool):
@@ -381,7 +405,7 @@ class CompanionServer(ThreadingHTTPServer):
         for key, maximum in (("position_s", 1e7), ("volume", 2)):
             if type(value[key]) not in (int, float) or not math.isfinite(value[key]) or not 0 <= value[key] <= maximum:
                 raise ValueError("Invalid native music timing or volume.")
-        if not isinstance(value["track"], dict) or set(value["track"]) - {"id", "title", "artist", "album"}:
+        if not isinstance(value["track"], dict) or set(value["track"]) - {"id", "title", "artist", "album", "genre", "mood"}:
             raise ValueError("Music state must contain only public track metadata.")
         for key, text in value["track"].items():
             if not isinstance(text, str) or len(text) > 500:
@@ -410,6 +434,7 @@ class CompanionServer(ThreadingHTTPServer):
                              if key in self.voice_context}
                     state["audio"] = copy.deepcopy(self.audio_state)
                     state["music"] = copy.deepcopy(self.music_state)
+                state["music_library"] = self.music.progress() if self.music else {"folder_selected": False, "status": "unavailable", "total": 0, "scanned": 0, "skipped": 0, "error": "Music support is unavailable.", "complete": False}
                 return {"status": "completed", "state": state}
             if name == "set_audio_volume":
                 if set(arguments) != {"channel", "operation", "value"}:
@@ -436,16 +461,27 @@ class CompanionServer(ThreadingHTTPServer):
             if name == "music_control":
                 if self.music is None:
                     raise ValueError("The music library is unavailable.")
-                if set(arguments) - {"action", "query", "track_id"}:
+                if set(arguments) - {"action", "query", "track_id", "mood", "mix"}:
                     raise ValueError("Unsupported music arguments.")
                 action = arguments.get("action")
                 if not isinstance(action, str) or action not in {"play", "pause", "resume", "stop", "next"}:
                     raise ValueError("Unknown music action.")
                 command = {"type": "music", "action": action}
                 if action == "play":
-                    if bool(arguments.get("query")) == bool(arguments.get("track_id")):
-                        raise ValueError("Play requires one song query or indexed track id.")
-                    if arguments.get("track_id"):
+                    if sum(bool(arguments.get(k)) for k in ("query", "track_id", "mood", "mix")) != 1:
+                        raise ValueError("Play requires one song query, indexed track id, or mood/genre mix.")
+                    selection = []
+                    label = arguments.get("query", "")
+                    if arguments.get("mood") or arguments.get("mix"):
+                        matches = (self.music.select_mix(arguments["mix"], limit=100) if arguments.get("mix")
+                                   else self.music.select_mood(arguments["mood"], limit=100))
+                        progress = matches["scan"]
+                        selection = matches["tracks"]
+                        label = matches["selection_label"]
+                        if not selection:
+                            return {"status": "failed", "error": "The scan is still running and no music matching that mood or genre has been indexed yet." if progress["status"] == "scanning" else "No indexed music matches that mood or genre in its metadata or folder labels.", "music_library": progress}
+                        track = selection[0]
+                    elif arguments.get("track_id"):
                         identifier = validate_id(arguments["track_id"])
                         # Lookup by opaque indexed id; only the native game receives
                         # the prepared local audio path through its existing endpoint.
@@ -454,19 +490,26 @@ class CompanionServer(ThreadingHTTPServer):
                         query = arguments["query"]
                         if not isinstance(query, str) or len(query) > 200:
                             raise ValueError("Song queries must be at most 200 characters.")
-                        matches = self.music.search(query, limit=10)
+                        matches = self.music.search(query, limit=100)
+                        progress = matches.get("scan") or self.music.progress()
                         tracks = matches.get("tracks", [])
                         exact = matches.get("exact_match_id")
                         track = next((item for item in tracks if item["id"] == exact), None)
-                        if track is None and len(tracks) == 1 and not matches.get("ambiguous"):
+                        if track is None and len(tracks) == 1 and not matches.get("ambiguous") and progress["complete"]:
                             track = tracks[0]
                         if track is None:
                             if not tracks:
-                                return {"status": "failed", "error": "No indexed song matched that request."}
-                            return {"status": "needs_selection", "message": "More than one indexed song matches. Ask which one to play.",
-                                    "tracks": [{key: item.get(key, "") for key in ("id", "title", "artist", "album")} for item in tracks]}
+                                return {"status": "failed", "error": "The scan is still running; that song has not been indexed yet. It may still be in the selected folder." if progress["status"] == "scanning" else "No indexed song matched that request.", "music_library": progress}
+                            return {"status": "needs_selection", "message": "The scan is incomplete; ask whether the player means this indexed match." if progress["status"] == "scanning" and len(tracks) == 1 else "More than one indexed song matches. Ask which one to play.",
+                                    "tracks": [{key: item.get(key, "") for key in ("id", "title", "artist", "album")} for item in tracks[:10]], "music_library": progress}
+                    if not selection:
+                        following = self.music.continuation(track["id"], limit=100)
+                        selection = following["tracks"]
+                        label = following["selection_label"]
                     command["track"] = {key: track.get(key, "") for key in ("id", "title", "artist", "album")}
-                elif arguments.get("query") or arguments.get("track_id"):
+                    command["queue"] = [{key: item.get(key, "") for key in ("id", "title", "artist", "album")} for item in selection] if selection else [command["track"]]
+                    command["selection_label"] = label
+                elif any(arguments.get(key) for key in ("query", "track_id", "mood", "mix")):
                     raise ValueError("Only play accepts a song selection.")
                 return self.controls.dispatch(command, timeout=95 if action in {"play", "next"} else None)
             raise ValueError("That game tool is not supported.")
@@ -481,6 +524,15 @@ class CompanionServer(ThreadingHTTPServer):
 
     def update_voice_context(self, value):
         """UI state is bounded; measurements and advice always come from storage."""
+        pending_review = value.get("review_pending_job_id")
+        if pending_review is not None:
+            if not value.get("speak") or value.get("playing") or not value.get("record_id"):
+                raise ValueError("Review announcements require a saved round and an accepted coaching job.")
+            job = self.jobs.get(validate_id(pending_review))
+            if job["record_id"] != value["record_id"]:
+                raise ValueError("This review belongs to another round.")
+            if job["status"] != "pending" or pending_review in self._review_notices:
+                return self.voice.status()
         context = {}
         for name in ("phase", "screen", "drill", "cue"):
             if name in value:
@@ -526,10 +578,12 @@ class CompanionServer(ThreadingHTTPServer):
         if record_id:
             report = self.storage.get_report(validate_id(record_id))
             voice_report = {key: report[key] for key in ("record_id", "drill", "started_at", "quality", "benchmark_key")}
-            voice_report["metrics"] = {name: {key: metric[key] for key in ("value", "unit")}
+            voice_report["metrics"] = {name: {key: metric[key] for key in ("value", "unit", "description") if key in metric}
                                        for name, metric in report.get("metrics", {}).items()}
             voice_report["evidence"] = [{"id": evidence["id"], "summary": evidence.get("summary", "")}
                                         for evidence in report.get("evidence", [])]
+            if "shot_placement" in report:
+                voice_report["shot_placement"] = copy.deepcopy(report["shot_placement"])
             context.update(record_id=record_id, report=voice_report,
                            comparison=benchmark_comparison(self.storage, report),
                            coaching=self._voice_advice(self.storage.get_coaching(record_id)))
@@ -575,14 +629,25 @@ class CompanionServer(ThreadingHTTPServer):
                 context["sensitivity_review"] = review
         announce_sensitivity = bool(experiment and
                                     (requested_sensitivity or context.get("phase") == "sensitivity"))
-        if value.get("speak") and not (announce_sensitivity or context.get("coaching")):
+        if value.get("speak") and not (pending_review or announce_sensitivity or context.get("coaching")):
             raise ValueError("Recorded coaching is required before announcing advice.")
         self._fit_voice_context(context)
         with self.workflow_lock:
             self.voice_context = context
         status = self.voice.update_context(context, speak=False)
         if value.get("speak"):
-            if announce_sensitivity:
+            if pending_review:
+                metrics = context.get("report", {}).get("metrics", {})
+                tracking = context.get("report", {}).get("drill") == "tracking"
+                metric = metrics.get("time_on_target_pct" if tracking else "accuracy_pct", {})
+                measured = metric.get("value")
+                finding = (f" {measured:.0f} percent {'on target while firing' if tracking else 'accuracy'}."
+                           if isinstance(measured, (int, float)) else "")
+                speech = "Round saved." + finding + " I’m reviewing what to practice next."
+                if len(self._review_notices) >= 100:
+                    self._review_notices.clear()
+                self._review_notices.add(pending_review)
+            elif announce_sensitivity:
                 if context.get("sensitivity_review_stale"):
                     review = {"summary": "New practice results were recorded after that review.",
                               "reason": context["analysis"].get("follow_up", {}).get("summary", "The sensitivity comparison has new evidence."),
@@ -631,7 +696,7 @@ class CompanionServer(ThreadingHTTPServer):
                     {"drill_id": "tracking", "label": "Smooth tracking", "button": button},
                     {"drill_id": "tracking", "tracking_motion": "reactive", "label": "Reactive tracking", "button": button},
                     {"drill_id": "switching", "label": "Target switching", "button": button}],
-                "home_buttons": ["Start guided baseline", "Find my sensitivity"],
+                "home_buttons": ["Practice", "Start guided baseline", "Finish guided baseline", "Find my sensitivity"],
                 "pause": {"key": "Escape", "buttons": ["Resume round", "End round and return"]},
                 "audio_controls": {"tool": "shadow_aim.set_audio_volume", "channels": ["voice", "music", "game"],
                                    "operations": ["set", "increase", "decrease"], "unit": "percent"},
@@ -780,6 +845,13 @@ class Handler(BaseHTTPRequestHandler):
                     "connection": coach.state, "error": coach.last_error, "account": account}
             elif not post and path == "/sessions":
                 result = {"sessions": self.server.storage.list_sessions()}
+            elif not post and path == "/training/next":
+                query = parse_qs(parsed.query)
+                raw = query.get("settings", [None])[0]
+                if raw is not None and len(raw) > 6000:
+                    raise ValueError("Training settings are too large.")
+                settings = self.server._voice_settings(json.loads(raw), "training settings") if raw is not None else None
+                result = next_training_action(self.server.storage, settings)
             elif not post and len(parts) == 2 and parts[0] == "sessions":
                 record_id = parts[1]
                 result = {"record": self.server.storage.get_session(record_id),

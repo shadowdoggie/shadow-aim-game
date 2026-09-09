@@ -1,6 +1,6 @@
 # Coaching model selection — 2026-09-09
 
-Default: **GPT-5.6 Sol, high effort**, through the existing ChatGPT subscription.
+Current default: **GPT-5.6 Sol, medium effort**, through the existing ChatGPT subscription. The installed model advertises medium effort; structured output, numeric evidence, goal, and citation validation are unchanged. This bounded-analysis setting was selected after a later high-effort review took 45.86 seconds. The original high-effort comparison and one subsequent medium-effort quality gate are recorded below.
 
 Six requests compared Sol/high and Luna/high on the same three fixed cases:
 baseline progress with a conflicting practice result; sensitivity screening with later
@@ -40,6 +40,9 @@ depends on the workload; these are not fixed per-message allowances.
 [Luna model](https://developers.openai.com/api/docs/models/gpt-5.6-luna),
 [Codex pricing](https://learn.chatgpt.com/docs/pricing).
 
+One subsequent Sol/medium request reused the baseline-versus-practice fixture with anonymized round identifiers and took **29.78 seconds**. Usage was **19,878 input tokens (0 cached), 847 output tokens, including 453 reasoning tokens**. It passed schema, evidence, goal, and citation validation; manual review confirmed that it recognized accuracy improving from 90.2% to 97.0%, acquisition improving from 746 to 683 ms, and overshoots falling from 43.8% to 17.7% against the correct baseline. It chose a modest speed progression while retaining accuracy/overshoot guardrails, without substituting the conflicting practice result. The single call left player history untouched. It does **not** demonstrate faster inference than high effort: the earlier high-effort run of this case took 16.13 seconds, and timing varies between calls.
+
 This is a small targeted regression check, not proof of general coaching quality or
 stable latency. Earlier Astra responses were a qualitative reference, not a rerun on
-this identical snapshot. No additional evaluation calls were made after selection.
+this identical snapshot. The medium-effort gate covered one case only; the other two
+cases were not rerun after the effort change.

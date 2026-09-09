@@ -1,7 +1,7 @@
 extends Node
 ## Native, simultaneous microphone capture and Juniper audio playback.
 ## Microphone audio starts only after an explicit start() and a connected session.
-## There is no speech gate, TTS fallback, or pause in capture while Juniper speaks.
+## Microphone capture stays continuous; user onset clears already-buffered speech.
 
 signal status_changed(state: String, message: String)
 
@@ -54,6 +54,7 @@ var _playback_waiting := true
 var _last_playback_skips := 0
 var _playback_capacity_frames := 0
 var _last_output_tick_ms := -1
+var _user_speech_active := false
 var _diagnostic_elapsed := 0.0
 var _last_capture_ms := -1
 var _input_sent_ms := 0
@@ -66,7 +67,8 @@ var _audio_diagnostics := {
 	"upload_total_ms": 0, "upload_max_ms": 0, "event_requests": 0,
 	"event_total_ms": 0, "event_max_ms": 0, "playback_rebuffers": 0,
 	"playback_underruns": 0, "playback_tick_max_ms": 0,
-	"playback_reserve_ms": 0, "mixer_quantum_ms": 0
+	"playback_reserve_ms": 0, "mixer_quantum_ms": 0,
+	"user_speech_interruptions": 0
 }
 
 
@@ -100,6 +102,7 @@ func toggle() -> void:
 func start() -> void:
 	if state == "connected" or state == "connecting":
 		return
+	_user_speech_active = false
 	if not is_instance_valid(_host) or str(_host.get("token")).is_empty():
 		_set_state("error", "Open Shadow Aim with its launcher to connect Juniper.")
 		return
@@ -234,6 +237,16 @@ func _handle_event(event: Dictionary) -> void:
 				_enqueue_output(event)
 		"interrupt":
 			clear_playback()
+		"user_speech_started":
+			if is_active and not _user_speech_active:
+				_user_speech_active = true
+				_audio_diagnostics.user_speech_interruptions += 1
+				clear_playback()
+		"user_speech_stopped":
+			# V3 final user turns can arrive seconds after actual speech ends.
+			# Do not discard fresh reply audio while waiting for that transcript,
+			# or flush a reply when the delayed final event eventually arrives.
+			_user_speech_active = false
 		"state", "status":
 			_apply_state(str(event.get("state", "")), str(event.get("error", event.get("message", ""))))
 		"error":
@@ -262,6 +275,7 @@ func _set_state(next: String, detail: String) -> void:
 
 
 func _begin_audio() -> void:
+	_user_speech_active = false
 	for key in _audio_diagnostics:
 		_audio_diagnostics[key] = 0
 	_diagnostic_elapsed = 0.0
@@ -561,6 +575,7 @@ func _cancel_requests() -> void:
 
 func _teardown_audio() -> void:
 	is_active = false
+	_user_speech_active = false
 	microphone_level = 0.0
 	for player in [_microphone, _speaker]:
 		if is_instance_valid(player):

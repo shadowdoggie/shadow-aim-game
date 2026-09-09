@@ -68,6 +68,19 @@ class FakeMusic:
                        {"id": "song-2", "title": "Another song", "artist": "Other artist", "album": "Album"}]
         self.scans = []
         self.prepared = []
+        self.scan_status = "ready"
+
+    def progress(self):
+        return {"folder_selected": True, "status": self.scan_status, "total": len(self.tracks), "scanned": len(self.tracks), "skipped": 0, "error": None, "complete": self.scan_status == "ready"}
+
+    def select_mood(self, mood, limit=100):
+        return {"tracks": self.tracks, "scan": self.progress(), "selection_label": "Relaxing music"}
+
+    def select_mix(self, query, limit=100):
+        return {"tracks": self.tracks, "scan": self.progress(), "selection_label": query.capitalize() + " music"}
+
+    def continuation(self, identifier, limit=100):
+        return {"tracks": [self.get_track(identifier)], "selection_label": "Selected song", "scan": self.progress()}
 
     def status(self):
         return {"root": "", "status": "idle", "tracks": self.tracks, "total": len(self.tracks), "error": None}
@@ -345,6 +358,16 @@ class ServerWorkflowTests(unittest.TestCase):
         self.assertEqual(self.voice.cursors, [7])
         self.assertEqual(self.request("POST", "/voice/stop", {})[1]["state"], "off")
 
+    def test_next_training_route_validates_settings_without_account_or_inference(self):
+        self.assertEqual(self.request("GET", "/training/next", authenticated=False)[0], 401)
+        status, step = self.request("GET", "/training/next?settings=%7B%22fov%22%3A103%7D")
+        self.assertEqual(status, 200)
+        self.assertEqual(step["action"], "baseline")
+        self.assertEqual(set(step["missing_modes"]), {"clicking", "tracking", "reactive_tracking", "switching"})
+        self.assertEqual(self.request("GET", "/training/next?settings=%5B%5D")[0], 400)
+        self.assertEqual(self.request("GET", "/training/next?settings=%7B%22fov%22%3A0%7D")[0], 400)
+        self.assertEqual(self.coach.calls, [])
+
     def test_voice_errors_have_no_coaching_fallback_and_routes_require_auth(self):
         for path in ("/voice/start", "/sensitivity/start"):
             self.assertEqual(self.request("POST", path, {}, authenticated=False)[0], 401)
@@ -361,6 +384,24 @@ class ServerWorkflowTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/voice/context", {"speak": True})[0], 400)
         self.assertEqual(self.voice.audio, [])
         self.assertEqual(self.voice.cursors, [])
+
+    def test_pending_review_announces_measured_results_once_and_requires_matching_job(self):
+        self.training_cycle()
+        payload = {"record_id": "retest", "screen": "results", "playing": False,
+                   "speak": True, "review_pending_job_id": "pending-review"}
+        with patch.object(self.jobs, "get", return_value={"status": "pending", "record_id": "retest"}):
+            self.assertEqual(self.request("POST", "/voice/context", payload)[0], 200)
+            spoken = self.voice.updates[-1]
+            self.assertTrue(spoken[1])
+            self.assertIn("97 percent accuracy", spoken[0])
+            self.assertIn("reviewing", spoken[0])
+            count = len(self.voice.updates)
+            self.assertEqual(self.request("POST", "/voice/context", payload)[0], 200)
+            self.assertEqual(len(self.voice.updates), count)
+            self.assertEqual(self.request("POST", "/voice/context", payload | {"record_id": "baseline"})[0], 400)
+        with patch.object(self.jobs, "get", return_value={"status": "failed", "record_id": "retest"}):
+            self.assertEqual(self.request("POST", "/voice/context", payload | {"review_pending_job_id": "failed-review"})[0], 200)
+            self.assertEqual(len(self.voice.updates), count)
 
     def test_voice_keeps_review_evidence_across_navigation_and_distinguishes_profile_and_trial_settings(self):
         self.training_cycle()
@@ -552,6 +593,7 @@ class ServerWorkflowTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/controls/" + action["id"] + "/ack", {"status": "completed", "value": 30})[1], {"accepted": True})
         self.assertTrue(finished.wait(1))
         worker.join(1)
+        self.assertGreater(result.pop("confirmed_at_unix_s"), 0)
         self.assertEqual(result, {"status": "completed", "channel": "music", "value": 30})
         self.request("POST", "/audio/state", {"voice": 100, "music": 30, "game": 70, "revision": 3})
         stale = self.request("POST", "/audio/state", {"voice": 100, "music": 50, "game": 70, "revision": 2})[1]
@@ -603,6 +645,40 @@ class ServerWorkflowTests(unittest.TestCase):
         self.assertEqual(playback["track"]["title"], "First song")
         self.assertNotIn("path", playback["track"])
         self.assertEqual(self.coach.calls, [])
+
+    def test_music_mix_chooses_queue_and_reports_fresh_partial_library_and_actual_playback(self):
+        self.server.music.close()
+        library = FakeMusic()
+        self.server.music = library
+        library.scan_status = "scanning"
+        before = self.server.voice_action("get_game_state", {})["state"]["music_library"]
+        library.tracks.append({"id": "song-3", "title": "Newly indexed", "artist": "Third", "album": "Album"})
+        after = self.server.voice_action("get_game_state", {})["state"]["music_library"]
+        self.assertEqual(after["total"], before["total"] + 1)
+        self.assertFalse(after["complete"])
+        self.assertNotIn("root", after)
+        missing = self.server.voice_action("music_control", {"action": "play", "query": "missing"})
+        self.assertIn("not been indexed yet", missing["error"])
+        self.assertEqual(missing["music_library"], after)
+        result, finished, worker = self.run_action("music_control", {"action": "play", "mix": "jazz"})
+        action = self.next_action()
+        self.assertEqual(action["queue"], library.tracks)
+        self.assertEqual(action["selection_label"], "Jazz music")
+        self.assertFalse(finished.is_set())
+        self.request("POST", "/controls/" + action["id"] + "/ack",
+                     {"status": "completed", "track": library.tracks[1], "changed_track": True})
+        self.assertTrue(finished.wait(1))
+        worker.join(1)
+        self.assertEqual(result["status"], "failed", "A different playing song must not confirm the requested one")
+        self.assertIn("different song", result["error"])
+        self.assertEqual(result["track"], library.tracks[1])
+        result, finished, worker = self.run_action("music_control", {"action": "next"})
+        action = self.next_action()
+        self.request("POST", "/controls/" + action["id"] + "/ack",
+                     {"status": "completed", "track": library.tracks[1], "changed_track": False})
+        self.assertTrue(finished.wait(1))
+        worker.join(1)
+        self.assertEqual(result["status"], "failed", "Next must not confirm a switch to the same song")
 
     def test_account_routes_quiesce_voice_and_coaching_before_scope_changes_and_reenable_only_after_login(self):
         self.training_cycle()
