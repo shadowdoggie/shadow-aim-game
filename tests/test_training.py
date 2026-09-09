@@ -165,6 +165,66 @@ class TrainingProgressionTests(unittest.TestCase):
         self.assertEqual(result["action"], "coached_practice")
         self.assertEqual(result["record_id"], "base-switching")
 
+    def test_unreviewed_free_round_reuses_actual_approved_source_and_reactive_baseline(self):
+        self.baseline()
+        plan = self.coach(drill="tracking", evidence="base-reactive_tracking")
+        self.save("new-free", kind="free", cycle="free-cycle")
+        result = next_training_action(Storage(self.temp.name))
+        self.assertEqual(result["action"], "coached_practice")
+        self.assertEqual(result["recommendation"], plan)
+        self.assertEqual(result["record_id"], "base-switching")
+        self.assertEqual(result["record"]["id"], "base-switching")
+        self.assertEqual(result["source_coaching_record_id"], "base-switching")
+        self.assertEqual(result["review_record_id"], "new-free")
+        self.assertEqual(result["baseline_record"]["id"], "base-reactive_tracking")
+        self.assertEqual(result["settings"]["tracking_motion"], "reactive")
+
+    def test_newer_approved_plan_always_wins_over_older_advice(self):
+        self.baseline()
+        self.coach()
+        self.save("reviewed-free", kind="free", cycle="first-free")
+        newer = self.coach(source="reviewed-free", evidence="reviewed-free")
+        newer["cue"] = "Use the new adjustment from this review."
+        self.storage.save_coaching("reviewed-free", newer)
+        self.save("pending-free", kind="free", cycle="second-free")
+        result = next_training_action(self.storage)
+        self.assertEqual(result["source_coaching_record_id"], "reviewed-free")
+        self.assertEqual(result["recommendation"], newer)
+        newest = self.coach(source="pending-free", evidence="pending-free")
+        result = next_training_action(self.storage)
+        self.assertEqual(result["source_coaching_record_id"], "pending-free")
+        self.assertEqual(result["recommendation"], newest)
+        self.assertEqual(result["review_record_id"], "")
+
+    def test_free_rounds_do_not_skip_remaining_practice_retest_or_retest_review(self):
+        self.baseline()
+        self.coach()
+        self.practice("practice-1")
+        self.save("free-1", kind="free", cycle="free-1")
+        result = next_training_action(self.storage)
+        self.assertEqual((result["action"], result["remaining_rounds"]), ("continue_practice", 1))
+        self.assertEqual(result["cycle_id"], "practice-cycle")
+        self.practice("practice-2")
+        self.save("free-2", kind="free", cycle="free-2")
+        result = next_training_action(self.storage)
+        self.assertEqual(result["action"], "retest")
+        self.assertEqual(result["settings"]["target_scale"], 1)
+        self.save("retest", kind="retest", cycle="practice-cycle", baseline="base-clicking", source="base-switching")
+        self.save("free-3", kind="free", cycle="free-3")
+        result = next_training_action(self.storage)
+        self.assertEqual((result["action"], result["record_id"]), ("review", "retest"))
+
+    def test_approved_advice_from_a_different_profile_cannot_replace_matching_plan(self):
+        self.baseline()
+        original = self.coach()
+        self.save("other-profile", kind="free", cycle="other", changes={"sensitivity_deg_per_count": .05})
+        self.coach(source="other-profile", evidence="other-profile")
+        self.save("pending-free", kind="free", cycle="current")
+        result = next_training_action(self.storage)
+        self.assertEqual(result["source_coaching_record_id"], "base-switching")
+        self.assertEqual(result["recommendation"], original)
+        self.assertEqual(result["settings"]["sensitivity_deg_per_count"], .025)
+
     def test_over_one_hundred_free_rounds_do_not_erase_initial_baseline(self):
         self.baseline()
         for index in range(101):

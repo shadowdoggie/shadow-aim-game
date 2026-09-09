@@ -202,6 +202,7 @@ def next_training_action(storage, settings: dict | None = None) -> dict:
     result = {"action": "baseline", "baseline_complete": not missing, "missing_modes": missing,
               "cycle_id": baseline_cycle, "record_id": "", "source_coaching_record_id": "",
               "recommendation": None, "baseline_record": None, "record": None, "report": None,
+              "review_record_id": "",
               "remaining_rounds": 0, "settings": None, "drill": None, "mode": None,
               "reason": "Complete the remaining baseline measurements."}
     if missing:
@@ -211,6 +212,28 @@ def next_training_action(storage, settings: dict | None = None) -> dict:
                    and record(item["record_id"]).get("completed")), None)
     if latest is None:
         latest = max(baseline_modes.values(), key=lambda item: item["started_at"])
+    latest_plan = storage.get_coaching(latest["record_id"])
+    if _kind(latest) == "free" and not _approved_plan(latest_plan):
+        pending_id = latest["record_id"]
+        current_profile = record(pending_id)["settings"]
+        for previous in recent:
+            previous_id = previous["record_id"]
+            if previous_id == pending_id or previous["started_at"] > latest["started_at"]:
+                continue
+            # Free rounds can keep the player moving while review runs. They
+            # neither consume prescribed blocks nor hide a pending retest.
+            progressing = _kind(previous) in {"practice", "retest"}
+            if not progressing and not previous.get("coaching_available"):
+                continue
+            plan = storage.get_coaching(previous_id)
+            if not progressing and not _approved_plan(plan):
+                continue
+            raw = record(previous_id)
+            if not raw.get("completed") or not _profile_matches(raw, current_profile):
+                continue
+            latest, latest_plan = previous, plan
+            result["review_record_id"] = pending_id
+            break
     latest_id = latest["record_id"]
     latest_record = record(latest_id)
     result.update(action="review", cycle_id="", record_id=latest_id, record=_snapshot(latest_record),
@@ -219,7 +242,6 @@ def next_training_action(storage, settings: dict | None = None) -> dict:
                       "training_context", "tracking_motion") if key in latest}),
                   reason="Review your latest completed round before choosing the next adjustment.")
     training = latest.get("training_context", {})
-    latest_plan = storage.get_coaching(latest_id)
     if _kind(latest) == "practice" and training.get("cycle_id") and not _approved_plan(latest_plan):
         source_id, baseline_id = training.get("source_coaching_record_id"), training.get("baseline_record_id")
         if not source_id or not baseline_id:
@@ -291,5 +313,5 @@ def next_training_action(storage, settings: dict | None = None) -> dict:
     result.update(action="coached_practice", source_coaching_record_id=latest_id,
                   recommendation=copy.deepcopy(plan), baseline_record=_snapshot(selected), remaining_rounds=2,
                   settings=_clean_settings(selected["settings"]) | plan["parameters"],
-                  drill=target, mode=_mode(selected), reason="Practice the adjustment approved for your latest results.")
+                  drill=target, mode=_mode(selected), reason="Practice your most recent approved adjustment.")
     return result

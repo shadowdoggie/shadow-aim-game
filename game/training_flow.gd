@@ -73,16 +73,37 @@ func _update_home() -> void:
 			_title.text = "Retest: " + title
 			_detail.text = "Check what changed at your original baseline difficulty."
 		"review":
-			_title.text = "Get your next coaching step"
-			_detail.text = "Juniper will review your saved measurements before choosing the next adjustment."
+			_title.text = "Keep practising"
+			_detail.text = "Continue at the same settings while Juniper reviews your measurements."
 
 func start_next() -> void:
 	if _busy or host.is_playing or host.is_replaying: return
 	var generation: int = host.page_generation
 	var step := await refresh()
 	if generation != host.page_generation or host.is_playing or host.is_replaying: return
-	if step.is_empty() or step.get("error") != null: return
-	apply_step(step)
+	if step.is_empty() or step.get("error") != null:
+		host._practice_while_reviewing()
+		return
+	if step.get("action","") == "review":
+		await _review_and_keep_playing(step)
+	else: apply_step(step)
+
+func _review_and_keep_playing(step: Dictionary) -> void:
+	var record: Dictionary = step.get("record",{}) if step.get("record") is Dictionary else {}
+	var report: Dictionary = step.get("report",{}) if step.get("report") is Dictionary else {}
+	var record_id: String = str(step.get("record_id",""))
+	if record.is_empty() and str(host.last_record.get("id","")) == record_id:
+		record = host.last_record.duplicate(true)
+		report = host.last_report.duplicate(true)
+	if record.get("drill","") not in host.DRILLS or not record.get("settings") is Dictionary: return
+	if host.job_id.is_empty() and not host.submitting_coach and not report.is_empty():
+		# Saved compact snapshots suffice; do not download a replay or wait for
+		# a model response before starting the player's next round.
+		if str(host.last_record.get("id","")) != record_id:
+			host.last_record = record.duplicate(true)
+			host.last_report = report.duplicate(true)
+		host._request_coaching()
+	host._practice_while_reviewing(record)
 
 func review_completed_baseline() -> void:
 	var record_id: String = str(host.last_record.get("id",""))

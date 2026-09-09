@@ -32,6 +32,7 @@ def coaching_context():
 
 def advice():
     return {"summary": "You achieved the previous target; try a slightly quicker switch.",
+        "spoken_summary": "You were quicker and missed less. Start moving to the next ball as soon as your shot hits.",
         "observation": "Accuracy rose from 90.2% to 97.0% while acquisition time fell.",
         "evidence_ids": ["current:shots-summary", "baseline:shots-summary"],
         "cue": "Start the next switch as soon as the hit confirms.", "drill": "switching",
@@ -137,6 +138,14 @@ class ProgressValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(CoachError, "incomplete"):
             self.validate(value)
 
+    def test_spoken_tip_is_short_and_contains_no_stats_or_technical_terms(self):
+        for tip in ("You hit 97% of the balls.", "Reduce acquisition overshoot.",
+                "Ninety seven percent is good.", "Try " * 61, ""):
+            value = advice()
+            value["spoken_summary"] = tip
+            with self.subTest(tip=tip), self.assertRaisesRegex(CoachError, "spoken tip"):
+                self.validate(value)
+
     def test_legacy_tracking_quality_does_not_hide_negligible_engagement(self):
         self.current["drill"] = "tracking"
         self.current["evidence"].append({"id": "current:aim-summary", "data": {"observed_s": .7}})
@@ -181,6 +190,45 @@ class ContextProtocolTests(unittest.TestCase):
         self.assertEqual(result, advice())
         self.assertEqual(coach.sent[1][1]["model"], MODEL)
         self.assertEqual(coach.sent[1][1]["effort"], "medium")
+        self.assertEqual(coach.sent[0][1]["developerInstructions"], "")
+
+    def test_compact_payload_keeps_measured_values_and_context_without_replay_traces(self):
+        current = recorded("current")
+        current["evidence"].extend([
+            {"id": "current:aim-summary", "kind": "aggregate", "data": {"observed_s": 31, "samples": 900}},
+            {"id": "current:shot-placement-summary", "kind": "aggregate", "data": {
+                "located_hits": 25, "recorded_hits": 27, "zones": {"center": 10, "edge": 5},
+                "examples": [{"trace": [{"yaw": 10}] * 100}]}},
+            {"id": "current:aim-examples", "kind": "samples", "data": [{"yaw": 20}] * 100}])
+        current["metrics"]["accuracy_pct"].update(unit="%", description="Long metric explanation",
+            evidence_ids=["current:shots-summary", "current:aim-examples"])
+        before = copy.deepcopy(current)
+        context = coaching_context()
+        context["journal"][0]["context"] = {"old_report": current}
+        coach = CapturingCoach(advice())
+        coach.recommend(current, [recorded("practice"), recorded("baseline")], coaching_context=context)
+        request = json.loads(coach.sent[1][1]["input"][0]["text"])
+        compact = request["report"]
+        self.assertEqual(current, before)
+        self.assertEqual(compact["metrics"]["accuracy_pct"], {
+            "value": 97.0149, "unit": "%", "evidence_ids": ["current:shots-summary"]})
+        self.assertEqual(compact["evidence"][-1]["data"], {
+            "located_hits": 25, "recorded_hits": 27, "zones": {"center": 10, "edge": 5}})
+        self.assertEqual(compact["evidence"][-2]["data"], {"observed_s": 31, "samples": 900})
+        self.assertEqual(request["coaching_context"]["comparison"], context["comparison"])
+        self.assertNotIn("context", request["coaching_context"]["journal"][0])
+        self.assertNotIn("current:aim-examples", request["allowed_evidence_ids"])
+        self.assertIn("baseline:shots-summary", request["allowed_evidence_ids"])
+        self.assertEqual(request["prior_goal_evaluation"]["status"], "met")
+
+    def test_omitted_replay_evidence_cannot_be_cited_even_when_recorded(self):
+        current = recorded("current")
+        current["evidence"].append({"id": "current:aim-examples", "kind": "samples", "data": []})
+        result = advice()
+        result["evidence_ids"].append("current:aim-examples")
+        coach = CapturingCoach(result)
+        with self.assertRaisesRegex(CoachError, "not supplied"):
+            coach.recommend(current, [recorded("baseline")], coaching_context=coaching_context())
 
 
 def sensitivity_analysis():
@@ -191,6 +239,7 @@ def sensitivity_analysis():
 
 def sensitivity_review():
     return {"summary": "The lower setting is worth a confirmation round.",
+        "spoken_summary": "The lower setting looks promising. Try it during normal practice and notice whether reaching the ball feels easier.",
         "reason": "Your repeated trials improved accuracy without slower acquisition.",
         "recommended_candidate_id": "lower", "evidence_ids": ["experiment:comparison"],
         "confidence": "medium", "next_step": "Confirm once now and recheck next session."}

@@ -269,6 +269,15 @@ class MusicTests(unittest.TestCase):
         self.assertEqual(self.library.select_mix("energetic jazz")["tracks"], [])
         self.assertEqual(self.library.select_mix("rokk")["tracks"], [])
 
+    def test_polite_house_requests_keep_the_requested_genre(self):
+        make_wav(self.root / "House/First.wav")
+        make_wav(self.root / "Jazz/Second.wav")
+        self.scan()
+        for query in ("house", "house music please", "house music pls", "house music plz", "play some house music thanks"):
+            selected = self.library.select_mix(query)
+            self.assertEqual(selected["selection_label"], "House music")
+            self.assertEqual([track["title"] for track in selected["tracks"]], ["First"])
+
     def test_category_aliases_keep_specific_genres_narrow_and_support_custom_labels(self):
         for folder, title in (("HipHop", "A"), ("Rhythm and Blues", "B"), ("Lo-Fi", "C"),
                               ("Techno", "D"), ("House", "E"), ("Drum & Bass", "F"), ("Vaporwave", "G")):

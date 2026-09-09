@@ -346,7 +346,8 @@ class ServerWorkflowTests(unittest.TestCase):
         self.assertEqual(context[0]["coaching"], advice)
         self.assertTrue(spoken[1])
         self.assertIsInstance(spoken[0], str)
-        self.assertIn("90% to 97%", spoken[0])
+        self.assertIn("improved accuracy", spoken[0])
+        self.assertNotRegex(spoken[0], r"\d|%")
         self.assertNotIn("Invented", spoken[0])
         self.assertNotIn("record_id", spoken[0])
         self.assertLessEqual(len(spoken[0].split()), 80)
@@ -393,8 +394,8 @@ class ServerWorkflowTests(unittest.TestCase):
             self.assertEqual(self.request("POST", "/voice/context", payload)[0], 200)
             spoken = self.voice.updates[-1]
             self.assertTrue(spoken[1])
-            self.assertIn("97 percent accuracy", spoken[0])
-            self.assertIn("reviewing", spoken[0])
+            self.assertIn("next focus", spoken[0])
+            self.assertNotRegex(spoken[0], r"\d|%|percent")
             count = len(self.voice.updates)
             self.assertEqual(self.request("POST", "/voice/context", payload)[0], 200)
             self.assertEqual(len(self.voice.updates), count)
@@ -414,8 +415,8 @@ class ServerWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 200)
         spoken = self.voice.updates[-1]
         self.assertTrue(spoken[1])
-        self.assertIn("95% to 97%", spoken[0])
-        self.assertIn("2.0 to 2.8", spoken[0])
+        self.assertNotRegex(spoken[0], r"\d|%|percent|degrees")
+        self.assertTrue(spoken[0])
         self.assertNotIn("Invented", spoken[0])
         self.assertLessEqual(len(spoken[0].split()), 80)
         # A newer unfinished screening must not replace the completed review.
@@ -560,7 +561,7 @@ class ServerWorkflowTests(unittest.TestCase):
         self.assertNotIn("sensitivity_review", context[0])
         self.assertEqual(context[0]["previous_sensitivity_review"]["reason"], original["review"]["reason"])
         self.assertEqual(set(context[0]["analysis"]["follow_up"]["record_ids"]), {"later-current", "later-lower"})
-        self.assertIn("New practice results", speech[0])
+        self.assertIn("newer rounds", speech[0])
         self.assertNotIn("Keep the tested base setting", speech[0])
         self.assertEqual(self.coach.reviews, [])
         # Only the explicit review request invokes Astra, with the new evidence.
@@ -679,6 +680,56 @@ class ServerWorkflowTests(unittest.TestCase):
         self.assertTrue(finished.wait(1))
         worker.join(1)
         self.assertEqual(result["status"], "failed", "Next must not confirm a switch to the same song")
+
+    def test_personal_memory_is_separate_from_rounds_and_clear_is_bound_to_account(self):
+        self.server.auth = FakeAuth(lambda: True)
+        status, first = self.request("GET", "/voice/memory")
+        self.assertEqual(status, 200)
+        self.assertTrue(first["available"])
+        self.assertEqual(first["memories"], [])
+        self.assertEqual(self.server.voice_action("player_memory", {
+            "action": "remember", "key": "name", "value": "Call me Morgan."})["status"], "completed")
+        snapshot = self.server.voice_action("get_game_state", {})["state"]["player_memory"]
+        self.assertEqual(snapshot["memories"][0]["value"], "Call me Morgan.")
+        self.request("POST", "/voice/context", {"screen": "home", "playing": False})
+        self.assertEqual(self.voice.updates[-1][0]["player_memory"]["count"], 1)
+        with patch.object(self.server.auth, "status", return_value={"state": "signed_in", "account": {"email": "second@example.test"}}):
+            second = self.request("GET", "/voice/memory")[1]
+            self.assertNotEqual(first["account_generation"], second["account_generation"])
+            self.assertEqual(second["memories"], [])
+            self.server.voice_action("player_memory", {"action": "remember", "key": "music", "value": "I like house music."})
+            self.assertEqual(self.request("POST", "/voice/memory/forget", {"all": True,
+                "account_generation": first["account_generation"]})[0], 400)
+            self.assertEqual(self.server.memory_snapshot()["count"], 1)
+            status, cleared = self.request("POST", "/voice/memory/forget", {"all": True,
+                "account_generation": second["account_generation"]})
+            self.assertEqual(status, 200)
+            self.assertEqual(cleared["count"], 0)
+        restored = self.request("GET", "/voice/memory")[1]
+        self.assertEqual(restored["memories"][0]["value"], "Call me Morgan.")
+        self.assertEqual(self.coach.calls, [])
+        self.assertEqual(self.storage.list_sessions(), [])
+
+    def test_unreadable_personal_memory_does_not_break_voice_and_can_be_cleared(self):
+        self.server.auth = FakeAuth(lambda: True)
+        first = self.request("GET", "/voice/memory")[1]
+        self.server.voice_action("player_memory", {"action": "remember", "key": "music", "value": "I like house music."})
+        path = next(self.server.player_memory.directory.glob("*.json"))
+        path.write_text("broken-json", encoding="utf-8")
+        with self.assertLogs("companion.server", level="WARNING") as captured:
+            status, snapshot = self.request("GET", "/voice/memory")
+            self.assertEqual(status, 200)
+            self.assertFalse(snapshot["available"])
+            self.assertEqual(self.request("POST", "/voice/context", {"screen": "home", "playing": False})[0], 200)
+            self.assertEqual(self.server.voice_action("get_game_state", {})["status"], "completed")
+            self.assertEqual(self.server.voice_action("player_memory", {"action": "read"})["status"], "failed")
+        self.assertEqual(len(captured.records), 1)
+        self.assertEqual(path.read_text(encoding="utf-8"), "broken-json")
+        status, cleared = self.request("POST", "/voice/memory/forget", {"all": True,
+            "account_generation": first["account_generation"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(cleared["available"])
+        self.assertEqual(cleared["count"], 0)
 
     def test_account_routes_quiesce_voice_and_coaching_before_scope_changes_and_reenable_only_after_login(self):
         self.training_cycle()

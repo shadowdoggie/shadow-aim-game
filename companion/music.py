@@ -74,7 +74,7 @@ def _mix_filters(query):
     text = _normalized(query)
     text = re.sub(r"^(?:please )?(?:play|put on|give me) ", "", text)
     text = re.sub(r"^(?:some|something|any|a bit of) ", "", text)
-    text = re.sub(r"(?: (?:music|songs|tracks|mix|playlist|please))+$", "", text)
+    text = re.sub(r"(?: (?:music|songs|tracks|mix|playlist|please|pls|plz|thanks))+$", "", text)
     if not text or text in {"music", "songs", "tracks", "mix", "playlist"}:
         raise MusicError("Choose a music genre or mood for the mix.")
     groups, names = [], []

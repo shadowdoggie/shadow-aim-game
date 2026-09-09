@@ -8,6 +8,7 @@ import hmac
 import json
 import logging
 import math
+import re
 import os
 from pathlib import Path
 import queue
@@ -23,6 +24,7 @@ from .metrics import DRILLS, analyze_record, canonicalize_json, validate_id
 from .sensitivity import add_follow_up, add_result, analyze_experiment, create_experiment
 from .storage import Storage
 from .training import benchmark_comparison, coaching_context, contextual_history, next_training_action
+from .player_memory import MemoryError as PlayerMemoryError, PlayerMemory
 from .voice_bridge import VoiceBridge, VoiceError
 
 LOG = logging.getLogger(__name__)
@@ -286,6 +288,10 @@ class CompanionServer(ThreadingHTTPServer):
         self.account_lock = threading.RLock()
         self.voice_context = {}
         self._review_notices = set()
+        self.player_memory = PlayerMemory(storage.data_dir) if hasattr(storage, "data_dir") else None
+        self._player_memory_scope = None
+        self._memory_generation = uuid.uuid4().hex
+        self._memory_read_failed = False
         self.audio_state = None
         self.audio_revision = None
         self.music_state = None
@@ -319,7 +325,68 @@ class CompanionServer(ThreadingHTTPServer):
     def _cache_account(self, state):
         with self.workflow_lock:
             self._account_snapshot = {"state": state["state"], "error": state.get("error")}
+            account = state.get("account") or {}
+            identity = account.get("id") or account.get("account_id") or account.get("email")
+            scope = (str(identity).strip().casefold() if state["state"] == "signed_in" and identity else None)
+            if scope != self._player_memory_scope:
+                if self._player_memory_scope:
+                    self.voice.stop()
+                self._player_memory_scope = scope
+                self._memory_generation = uuid.uuid4().hex
+                self.voice_context.pop("player_memory", None)
         return state
+
+    def memory_snapshot(self, max_chars=3000):
+        with self.account_lock:
+            scope = self._player_memory_scope
+            if self._account_transition or not scope or self.player_memory is None:
+                return {"available": False, "memories": [], "count": 0, "truncated": False,
+                        "account_generation": self._memory_generation}
+            try:
+                context = self.player_memory.get_context(scope, max_chars=max_chars)
+            except PlayerMemoryError:
+                if not self._memory_read_failed:
+                    LOG.warning("Personal memory read failed; voice remains available and saved notes are preserved.", exc_info=True)
+                self._memory_read_failed = True
+                return {"available": False, "memories": [], "count": 0, "truncated": False,
+                        "error": "Saved memories could not be read. You can clear them in Settings.",
+                        "account_generation": self._memory_generation}
+            self._memory_read_failed = False
+            return {**context, "account_generation": self._memory_generation}
+
+    def memory_action(self, arguments, generation=None):
+        with self.account_lock:
+            if self._account_transition or not self._player_memory_scope or self.player_memory is None:
+                raise ValueError("Sign in with ChatGPT to use your saved memories.")
+            if generation is not None and generation != self._memory_generation:
+                raise ValueError("The signed-in account changed. Refresh its memories before clearing them.")
+            action = arguments.get("action")
+            if action == "read" and not set(arguments) - {"action", "query"}:
+                snapshot = self.memory_snapshot(max_chars=32768)
+                if not snapshot["available"]:
+                    return {"status": "failed", "error": snapshot["error"], "player_memory": snapshot}
+                query = arguments.get("query", "")
+                if not isinstance(query, str) or len(query) > 200:
+                    raise ValueError("Memory searches must be at most 200 characters.")
+                if query.strip():
+                    terms = query.casefold().split()
+                    snapshot["memories"] = [note for note in snapshot["memories"]
+                        if any(term in (note["key"] + " " + note["value"]).casefold() for term in terms)]
+                snapshot["truncated"] = len(snapshot["memories"]) > 10
+                snapshot["memories"] = snapshot["memories"][:10]
+                return {"status": "completed", "player_memory": snapshot}
+            if action == "remember" and set(arguments) == {"action", "key", "value"}:
+                self.player_memory.remember(self._player_memory_scope, arguments["key"], arguments["value"])
+            elif action == "forget" and set(arguments) == {"action", "key"}:
+                self.player_memory.forget(self._player_memory_scope, arguments["key"])
+            elif action == "forget_all" and set(arguments) == {"action"}:
+                self.player_memory.forget(self._player_memory_scope)
+            else:
+                raise ValueError("Unknown memory action or arguments.")
+            snapshot = self.memory_snapshot()
+            with self.workflow_lock:
+                self.voice_context["player_memory"] = snapshot
+            return {"status": "completed", "player_memory": snapshot}
 
     def account_status(self):
         if self.auth is None:
@@ -340,6 +407,9 @@ class CompanionServer(ThreadingHTTPServer):
 
     def _quiesce_account(self):
         self._account_transition = True
+        self._memory_generation = uuid.uuid4().hex
+        self._player_memory_scope = None
+        self.voice_context.pop("player_memory", None)
         self.controls.cancel_all("Account access changed before the game confirmed this action.")
         self.voice.stop()
         self.jobs.close()
@@ -435,7 +505,10 @@ class CompanionServer(ThreadingHTTPServer):
                     state["audio"] = copy.deepcopy(self.audio_state)
                     state["music"] = copy.deepcopy(self.music_state)
                 state["music_library"] = self.music.progress() if self.music else {"folder_selected": False, "status": "unavailable", "total": 0, "scanned": 0, "skipped": 0, "error": "Music support is unavailable.", "complete": False}
+                state["player_memory"] = self.memory_snapshot()
                 return {"status": "completed", "state": state}
+            if name == "player_memory":
+                return self.memory_action(arguments)
             if name == "set_audio_volume":
                 if set(arguments) != {"channel", "operation", "value"}:
                     raise ValueError("Volume requires channel, operation and value.")
@@ -479,7 +552,7 @@ class CompanionServer(ThreadingHTTPServer):
                         selection = matches["tracks"]
                         label = matches["selection_label"]
                         if not selection:
-                            return {"status": "failed", "error": "The scan is still running and no music matching that mood or genre has been indexed yet." if progress["status"] == "scanning" else "No indexed music matches that mood or genre in its metadata or folder labels.", "music_library": progress}
+                            return {"status": "failed", "error_code": "mix_no_match", "selection_label": label, "error": "The scan is still running and no music matching that mood or genre has been indexed yet." if progress["status"] == "scanning" else "No indexed music matches that mood or genre in its metadata or folder labels.", "music_library": progress}
                         track = selection[0]
                     elif arguments.get("track_id"):
                         identifier = validate_id(arguments["track_id"])
@@ -499,7 +572,7 @@ class CompanionServer(ThreadingHTTPServer):
                             track = tracks[0]
                         if track is None:
                             if not tracks:
-                                return {"status": "failed", "error": "The scan is still running; that song has not been indexed yet. It may still be in the selected folder." if progress["status"] == "scanning" else "No indexed song matched that request.", "music_library": progress}
+                                return {"status": "failed", "error_code": "song_no_match", "error": "The scan is still running; that song has not been indexed yet. It may still be in the selected folder." if progress["status"] == "scanning" else "No indexed song matched that request.", "music_library": progress}
                             return {"status": "needs_selection", "message": "The scan is incomplete; ask whether the player means this indexed match." if progress["status"] == "scanning" and len(tracks) == 1 else "More than one indexed song matches. Ask which one to play.",
                                     "tracks": [{key: item.get(key, "") for key in ("id", "title", "artist", "album")} for item in tracks[:10]], "music_library": progress}
                     if not selection:
@@ -511,10 +584,13 @@ class CompanionServer(ThreadingHTTPServer):
                     command["selection_label"] = label
                 elif any(arguments.get(key) for key in ("query", "track_id", "mood", "mix")):
                     raise ValueError("Only play accepts a song selection.")
-                return self.controls.dispatch(command, timeout=95 if action in {"play", "next"} else None)
+                result = self.controls.dispatch(command, timeout=95 if action in {"play", "next"} else None)
+                if result["status"] == "completed" and action == "play":
+                    result.update(selection_label=command["selection_label"], queue_count=len(command["queue"]))
+                return result
             raise ValueError("That game tool is not supported.")
         except (ValueError, KeyError) as exc:
-            return {"status": "failed", "error": str(exc)[:300]}
+            return {"status": "failed", "error_code": "invalid_request", "error": str(exc)[:300]}
 
     def sensitivity_state(self, experiment_id):
         experiment = self.storage.get_sensitivity_experiment(experiment_id)
@@ -614,7 +690,7 @@ class CompanionServer(ThreadingHTTPServer):
             compact["candidates"] = [{key: candidate[key] for key in ("id", "sensitivity_deg_per_count", "metrics",
                 "repeat_consistency", "quality_flags", "regression_flags") if key in candidate} for candidate in stored.get("candidates", [])]
             review = {key: str(experiment["review"][key])[:700] for key in
-                      ("summary", "reason", "recommended_candidate_id", "confidence", "next_step") if key in experiment["review"]}
+                      ("summary", "reason", "recommended_candidate_id", "confidence", "next_step", "spoken_summary") if key in experiment["review"]}
             if stored.get("follow_up"):
                 compact["follow_up"] = copy.deepcopy(stored["follow_up"])
                 compact["follow_up"].pop("evidence", None)  # Comparisons retain values and source ids.
@@ -631,19 +707,14 @@ class CompanionServer(ThreadingHTTPServer):
                                     (requested_sensitivity or context.get("phase") == "sensitivity"))
         if value.get("speak") and not (pending_review or announce_sensitivity or context.get("coaching")):
             raise ValueError("Recorded coaching is required before announcing advice.")
+        context["player_memory"] = self.memory_snapshot()
         self._fit_voice_context(context)
         with self.workflow_lock:
             self.voice_context = context
         status = self.voice.update_context(context, speak=False)
         if value.get("speak"):
             if pending_review:
-                metrics = context.get("report", {}).get("metrics", {})
-                tracking = context.get("report", {}).get("drill") == "tracking"
-                metric = metrics.get("time_on_target_pct" if tracking else "accuracy_pct", {})
-                measured = metric.get("value")
-                finding = (f" {measured:.0f} percent {'on target while firing' if tracking else 'accuracy'}."
-                           if isinstance(measured, (int, float)) else "")
-                speech = "Round saved." + finding + " I’m reviewing what to practice next."
+                speech = "Nice work finishing that round. Give me a moment to pick your next focus."
                 if len(self._review_notices) >= 100:
                     self._review_notices.clear()
                 self._review_notices.add(pending_review)
@@ -651,22 +722,32 @@ class CompanionServer(ThreadingHTTPServer):
                 if context.get("sensitivity_review_stale"):
                     review = {"summary": "New practice results were recorded after that review.",
                               "reason": context["analysis"].get("follow_up", {}).get("summary", "The sensitivity comparison has new evidence."),
-                              "next_step": "Request an updated sensitivity review before treating the old recommendation as current."}
+                              "next_step": "Check your newer rounds before changing your setting.",
+                              "spoken_summary": "You've practiced since that comparison. Let's check the newer rounds before changing your setting."}
                 else:
                     review = context["sensitivity_review"]
-                # Reserve words for the concrete finding, rather than spending
-                # the entire announcement repeating a generic headline.
-                speech = " ".join(" ".join(str(review.get(key, "")).split()[:limit])
-                                  for key, limit in (("summary", 18), ("reason", 42), ("next_step", 20)))
+                speech = self._spoken_review(review)
             else:
                 advice = context["coaching"]
-                duration = advice.get("parameters", {}).get("duration_s", 45)
-                names = {"clicking": "Precision clicking", "tracking": "Smooth tracking", "switching": "Target switching"}
-                speech = " ".join((advice.get("progress_summary", advice.get("summary", "")), advice.get("cue", ""),
-                                   f"Next, {duration} seconds of {names.get(advice.get('drill'), 'practice')}."))
+                speech = self._spoken_review(advice)
             # appendSpeech is literal speech, never a prompt or a JSON payload.
             status = self.voice.update_context(" ".join(speech.split()[:80]), speak=True)
         return status
+
+    @staticmethod
+    def _spoken_review(advice):
+        """Keep old saved reviews usable without reading their numeric analysis."""
+        text = str(advice.get("spoken_summary") or advice.get("cue") or advice.get("next_step") or "")
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        sentences = [sentence for sentence in sentences if not re.search(
+            r"\d|%|\b(?:percent|milliseconds?|degrees?|accuracy_pct|acquisition_ms)\b", sentence, re.I)]
+        text = " ".join(sentences)
+        for technical, plain in (("target acquisition", "getting onto the ball"),
+                ("acquisition", "getting onto the ball"), ("overshoots", "moving past the ball"),
+                ("overshoot", "moving past the ball"), ("retention", "whether it sticks"),
+                ("retest", "try again"), ("target", "ball")):
+            text = re.sub(r"\b" + re.escape(technical) + r"\b", plain, text, flags=re.I)
+        return text or "Your next practice is ready. Let's take it one small adjustment at a time."
 
     @staticmethod
     def _voice_settings(settings, label):
@@ -765,6 +846,13 @@ class CompanionServer(ThreadingHTTPServer):
         if size() > 17_000:
             context.get("report", {}).pop("evidence", None)
         if size() > 17_000:
+            for metric in context.get("report", {}).get("metrics", {}).values():
+                metric.pop("description", None)
+        personal = context.get("player_memory", {})
+        while personal.get("memories") and size() > 17_000:
+            personal["memories"].pop()
+            personal["truncated"] = True
+        if size() > 17_000:
             raise ValueError("The voice context exceeds its supported size.")
 
     @staticmethod
@@ -772,7 +860,7 @@ class CompanionServer(ThreadingHTTPServer):
         if not isinstance(advice, dict):
             return None
         selected = {key: copy.deepcopy(advice[key]) for key in ("summary", "cue", "progress_summary", "decision", "decision_reason",
-            "goal_status", "goals", "drill", "parameters", "success_criterion") if key in advice}
+            "goal_status", "goals", "drill", "parameters", "success_criterion", "spoken_summary") if key in advice}
         return {key: value[:500] if isinstance(value, str) else value for key, value in selected.items()}
 
 
@@ -927,6 +1015,18 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.server.controls.acknowledge(parts[1], self._json())
             elif not post and path == "/voice/status":
                 result = self.server.voice.status()
+            elif not post and path == "/voice/memory":
+                self.server.account_status()
+                result = self.server.memory_snapshot(max_chars=32768)
+            elif post and path == "/voice/memory/forget":
+                value = self._json()
+                if value.get("all") is not True or set(value) - {"all", "account_generation"}:
+                    raise ValueError("Clear memories requires an explicit all selection.")
+                if not isinstance(value.get("account_generation"), str):
+                    raise ValueError("Refresh your saved memories before clearing them.")
+                self.server.account_status()
+                self.server.memory_action({"action": "forget_all"}, value["account_generation"])
+                result = self.server.memory_snapshot(max_chars=32768)
             elif post and path == "/voice/start":
                 self._json()
                 self.server.require_account()

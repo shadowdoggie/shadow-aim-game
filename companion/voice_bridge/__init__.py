@@ -40,10 +40,11 @@ ANNOUNCEMENT_MAX_AGE_SECONDS = 20
 ACTION_TIMEOUT_SECONDS = 25
 MUSIC_PREPARATION_TIMEOUT_SECONDS = 110
 APP_STATE_TIMEOUT_SECONDS = 2
+ACTION_CONTEXT_TIMEOUT_SECONDS = 1
 CONTROL_TURN_MAX_AGE_SECONDS = 120
 APP_TOOL_NAMESPACE = "shadow_aim"
 APP_TOOLS = [{"type": "namespace", "name": APP_TOOL_NAMESPACE,
-    "description": "Read Shadow Aim state and control its music and audio with confirmed native results.",
+    "description": "Read Shadow Aim state, control music/audio with confirmed native results, and manage the signed-in player's shared personal memory.",
     "tools": [
         {"type": "function", "name": "get_game_state", "deferLoading": False,
          "description": "Read current game, audio volume, and selected local music-library state. No changes.",
@@ -70,10 +71,38 @@ APP_TOOLS = [{"type": "namespace", "name": APP_TOOL_NAMESPACE,
                   "mix": {"type": "string", "minLength": 1, "maxLength": 200}},
               "required": ["action", "mix"], "additionalProperties": False},
              {"properties": {"action": {"enum": ["pause", "resume", "stop", "next"]}},
+              "required": ["action"], "additionalProperties": False}]}},
+        {"type": "function", "name": "player_memory", "deferLoading": False,
+         "description": "Read or remember the signed-in player's stable shared preferences, interests, name, and goals; correct or forget them on request. No raw transcripts, credentials, inferred traits, or routine commands. Account scope is managed by the app.",
+         "inputSchema": {"type": "object", "oneOf": [
+             {"properties": {"action": {"const": "read"}, "query": {"type": "string", "maxLength": 200}},
+              "required": ["action"], "additionalProperties": False},
+             {"properties": {"action": {"const": "remember"}, "key": {"type": "string", "minLength": 1, "maxLength": 64},
+                  "value": {"type": "string", "minLength": 1, "maxLength": 300}},
+              "required": ["action", "key", "value"], "additionalProperties": False},
+             {"properties": {"action": {"const": "forget"}, "key": {"type": "string", "minLength": 1, "maxLength": 64}},
+              "required": ["action", "key"], "additionalProperties": False},
+             {"properties": {"action": {"const": "forget_all"}},
               "required": ["action"], "additionalProperties": False}]}}
     ]}]
 VOICE_INSTRUCTIONS = """You are the player's live voice coach in Shadow Aim.
 Answer the actual question first, naturally, in one or two useful sentences.
+Be a warm, encouraging companion who remembers the player's supplied preferences
+and shared training history. Recognize specific effort and real progress without
+forced positivity, guilt, flattery, or pretending to be human or an exclusive
+relationship. Match their mood; a frustrating round needs understanding and one
+helpful next step. Speak coaching in everyday words, without scores, percentages,
+timings, or other numeric recaps unless the player explicitly asks for numbers.
+Measurements remain your evidence; translate them into what felt or worked better.
+Use short, familiar words and one small thing the player can try immediately.
+Avoid terms such as acquisition, overshoot, retention, and benchmark in speech;
+say what to do, for example 'Ease up just before the target, then click.'
+Use player_memory for personal continuity, separately from recorded-round memory.
+For personal follow-ups, or remembering/correcting/forgetting something, ask the
+backing coach to use the player_memory tool through the allowed handoff. Remember
+stable interests, name, preferences, and goals the player explicitly shares; do
+not invent traits, save routine commands or passing remarks, or store credentials
+or raw transcripts. Memory updates need no spoken storage explanation unless asked.
 Use a measured finding and one concrete next action from the supplied coaching.
 Recognize gains. Explain why keeping a cue still helps, or what changes next;
 do not mindlessly repeat an already successful prescription. Compare the same
@@ -100,12 +129,14 @@ music or volume action through Codex's built-in background-agent handoff. Pass
 the player's request to that agent instead of claiming controls are unavailable
 or explaining how to do it manually. The backing coach executes the registered
 app tool and returns its confirmed result. This handoff is explicitly allowed.
-Only those app controls are available;
+Only those app controls and the registered player_memory tool are available;
 do not claim to click UI, change aim sensitivity, or start a drill yourself.
 For music use the selected local library. Search by the spoken query; if matches
 are ambiguous, ask which returned title or artist. Never invent a track ID/path.
 For a mood/genre playlist or background mix, use music_control action play with
 mix set to the requested category (such as relaxing, heavy metal, or jazz).
+Keep the category the player actually requested; do not invent a narrower
+subgenre or mood. For 'house music', use house, not an unasked house subgenre.
 Automatically choose and play from its matching queue; do not ask the player to
 pick a song or offer a suggestion list for a category request. A specifically
 named song uses query. An artist request without a specific song uses mix with
@@ -124,6 +155,12 @@ for state observations. Neither is a new command. Never announce an old playback
 snapshot or historical tool result as something you just did. If an old result
 arrives after the conversation has moved on, do not revive that confirmation;
 answer the current request using fresh tool state when needed.
+latest_app_action outcomes are ordered by request_sequence within their scope.
+A newer completed music action supersedes an older failed attempt. If an older
+failure handoff arrives after that success, use the newer confirmed outcome;
+do not say nothing was found when the requested music has since started. A silent
+outcome update itself needs no separate announcement. Correct a prior failure
+briefly if necessary, using the actual returned title and avoiding duplicate replies.
 For failed or unconfirmed actions, explain briefly; inspect state before retrying.
 For 'a little quieter/louder', a 10-percentage-point change is a useful default.
 Use exact visible labels from ui_controls when giving steps. On Train the cards
@@ -140,6 +177,18 @@ browse, or execute commands. Apart from Codex's built-in background-agent
 handoff, use only the registered shadow_aim app tools. Use Juniper throughout.
 """
 BACKING_INSTRUCTIONS = """You are Shadow Aim's backing coach and app-control executor.
+Use a warm, natural, supportive tone. Acknowledge specific effort or improvement;
+do not flatter, pressure, or pretend to be human. Explain coaching without numeric
+recaps or percentages unless the player asks for numbers. Keep measured facts as
+evidence and describe their practical meaning in ordinary words.
+Use familiar words and one small practical instruction; avoid acquisition,
+overshoot, retention, and benchmark jargon. Use player_memory read for personal
+follow-ups, remember for stable interests/name/preferences/goals explicitly
+shared by the player, and forget/forget_all when requested. Do not infer traits,
+store routine commands, passing remarks, credentials, or raw transcripts. Treat
+player_memory separately from the recorded-round journal. Answer naturally;
+do not narrate storage mechanics unless asked. Never claim a failed memory write
+was saved. These memory tools are allowed alongside music and volume controls.
 Execute the player's requested music or volume action yourself using the registered
 shadow_aim tools. Use functions.exec to call those tools when Code Mode exposes them.
 Do not create or delegate to another agent: these app tools belong to this thread.
@@ -153,10 +202,15 @@ does not confirm that a requested action ran. Keep the result terse.
 Use confirmed_at_unix_s to distinguish an action outcome from an observed_at_unix_s
 state snapshot. Never narrate a historical result as a new action. Do not execute
 an old control request after its turn has ended; ask for a fresh request instead.
+Check superseded_by and latest_app_action before reporting an outcome: a newer
+completed action replaces an older failure for that control scope. Do not repeat
+the old failure or retry a command which a newer request already completed.
 Use indexed song queries or returned opaque track IDs, never a guessed file path.
 For a mood/genre playlist or background mix, call music_control with action play
-and mix set to the requested category, not a guessed song query. Automatically
-play its matching queue without asking for a song selection. Next preserves it.
+and mix set to the requested category, not a guessed song query. Keep that
+requested category broad unless the player named a narrower one;
+do not turn house into an unrequested subgenre or add an unrequested mood.
+Automatically play its matching queue without asking for a song selection. Next preserves it.
 If no matching category is available, report the tool's result honestly.
 While music_library is scanning, counts and search results are partial. Read fresh
 get_game_state for scan progress and use music_control for the current search.
@@ -214,6 +268,19 @@ def _app_arguments(name, arguments):
                 raise VoiceError("Playing music requires exactly one query, track ID, mix, or supported mood.")
         elif set(arguments) != {"action"} or arguments["action"] not in ("pause", "resume", "stop", "next"):
             raise VoiceError("Unknown music control or unexpected arguments.")
+    elif name == "player_memory":
+        action = arguments.get("action")
+        allowed = {"read": ({"action"}, {"action", "query"}),
+                   "remember": ({"action", "key", "value"},),
+                   "forget": ({"action", "key"},), "forget_all": ({"action"},)}
+        if not isinstance(action, str) or action not in allowed or set(arguments) not in allowed[action]:
+            raise VoiceError("Unknown memory action or unexpected arguments.")
+        for key, limit in (("query", 200), ("key", 64), ("value", 300)):
+            if key in arguments:
+                value = arguments[key]
+                if not isinstance(value, str) or len(value) > limit or (key != "query" and not value.strip()):
+                    raise VoiceError("The memory field is empty or too long.")
+                arguments = {**arguments, key: value.strip()}
     else:
         raise VoiceError("That app control is unavailable.")
     return dict(arguments)
@@ -447,6 +514,10 @@ class _Session:
         self.action_lock = asyncio.Lock()
         self.action_calls = {}
         self.backing_turns = {}
+        self.action_sequence = 0
+        self.action_outcomes = {}
+        self.latest_app_actions = {}
+        self.last_completed_actions = {}
 
     def emit(self, event):
         if not self.closed and self.generation == self.bridge._generation:
@@ -774,7 +845,7 @@ class _Session:
 
     async def handle_app_action(self, request_id, params):
         name = params.get("tool")
-        safe_name = name if name in ("get_game_state", "set_audio_volume", "music_control") else "unknown"
+        safe_name = name if name in ("get_game_state", "set_audio_volume", "music_control", "player_memory") else "unknown"
         LOG.info("voice_app_request thread_id=%s tool=%s session_match=%s namespace_match=%s",
                  self.thread_id, safe_name, params.get("threadId") == self.thread_id,
                  params.get("namespace") == APP_TOOL_NAMESPACE)
@@ -808,6 +879,10 @@ class _Session:
                             if len(self.action_calls) <= 128:
                                 break
             result = await asyncio.shield(task)
+            outcome = self.action_outcomes.get(call_id)
+            latest = self.latest_app_actions.get(outcome["scope"]) if outcome else None
+            if latest and latest["request_sequence"] > outcome["request_sequence"]:
+                result = {**result, "superseded_by": latest}
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -824,6 +899,10 @@ class _Session:
 
     async def run_app_action(self, call_id, name, arguments, turn_id=None):
         started = time.monotonic()
+        self.action_sequence += 1
+        sequence = self.action_sequence
+        selector = next((key for key in ("mix", "mood", "query", "track_id") if key in arguments), "none")
+        error_type = "none"
         result = {"status": "failed", "error": "App controls are unavailable."}
         try:
             if not self.bridge.action_handler:
@@ -852,8 +931,10 @@ class _Session:
                 raise VoiceError("The app-control result was too large to present.")
             result = json.loads(encoded)
         except asyncio.TimeoutError:
+            error_type = "TimeoutError"
             result = {"status": "failed", "error": "The native control outcome was not confirmed in time. Check its state before retrying."}
         except Exception as error:
+            error_type = type(error).__name__
             if not isinstance(error, VoiceError):
                 # Callback failures can contain filesystem paths or account
                 # details. Record the failure class, never raw exception text.
@@ -861,9 +942,110 @@ class _Session:
                             self.thread_id, name, call_id, type(error).__name__)
             result = {"status": "failed", "error": _safe_error(error)}
         finally:
-            LOG.info("voice_app_action tool=%s call_id=%s status=%s duration_ms=%d", name, call_id,
-                     result.get("status"), (time.monotonic() - started) * 1000)
+            code = result.get("error_code")
+            safe_code = code if code in ("mix_no_match", "song_no_match", "invalid_request", "native_unconfirmed") else "none"
+            action = arguments.get("action", arguments.get("operation", "read"))
+            LOG.info("voice_app_action tool=%s call_id=%s action=%s selector=%s status=%s error_type=%s error_code=%s duration_ms=%d",
+                     name, call_id, action, selector, result.get("status"), error_type, safe_code,
+                     (time.monotonic() - started) * 1000)
+        if name == "player_memory":
+            if result.get("status") == "completed" and arguments["action"] != "read":
+                await self.publish_player_memory(result.get("player_memory"))
+        elif name != "get_game_state":
+            await self.publish_app_action_outcome(call_id, sequence, name, arguments, result)
         return result
+
+    @staticmethod
+    def compact_player_memory(value):
+        if not isinstance(value, dict):
+            return None
+        compact = {key: value[key] for key in ("available", "count", "truncated") if key in value}
+        compact["memories"] = [{key: item[key] for key in ("key", "value", "updated_at") if key in item}
+                               for item in value.get("memories", []) if isinstance(item, dict)][:50]
+        return compact
+
+    async def publish_player_memory(self, value):
+        compact = self.compact_player_memory(value)
+        if compact is None or not self.process or self.closed or self.closing:
+            return
+        async def deliver():
+            async with self.context_lock:
+                if self.closed or self.closing or self.generation != self.bridge._generation:
+                    return
+                text = ("Silent player-memory replacement. These are the current signed-in player's "
+                        "saved shared preferences and interests; supersede older player_memory, "
+                        "including facts now removed. Keep recorded-round coaching memory separate. "
+                        "Answer naturally without announcing this update or starting another task.\n" +
+                        json.dumps({"player_memory": compact}, ensure_ascii=False, separators=(",", ":")))
+                await self.rpc("thread/realtime/appendText", {"threadId": self.thread_id,
+                    "role": "developer", "text": text})
+                await self.rpc("thread/inject_items", {"threadId": self.thread_id, "items": [
+                    {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": text}]}]})
+                self.last_app_state_key = ""
+        try:
+            await asyncio.wait_for(deliver(), ACTION_CONTEXT_TIMEOUT_SECONDS)
+        except Exception as error:
+            LOG.warning("voice_player_memory_context_unavailable thread_id=%s error_type=%s",
+                        self.thread_id, type(error).__name__)
+
+    async def publish_app_action_outcome(self, call_id, sequence, name, arguments, result):
+        scope = "music" if name == "music_control" else "volume:" + arguments["channel"]
+        outcome = {"scope": scope, "request_sequence": sequence, "tool": name,
+                   "action": arguments.get("action", arguments.get("operation")),
+                   "status": result.get("status"), "observed_at_unix_s": time.time()}
+        for key in ("confirmed_at_unix_s", "changed_track", "channel", "value", "volume", "error_code"):
+            if key in result:
+                outcome[key] = result[key]
+        if isinstance(result.get("track"), dict):
+            outcome["track"] = {key: result["track"][key] for key in ("id", "title", "artist", "album")
+                                if key in result["track"]}
+        self.action_outcomes[call_id] = outcome
+        if len(self.action_outcomes) > 128:
+            del self.action_outcomes[next(iter(self.action_outcomes))]
+        previous = self.latest_app_actions.get(scope)
+        if previous is None or sequence > previous["request_sequence"]:
+            self.latest_app_actions[scope] = outcome
+        if result.get("status") == "completed":
+            # Actual completion can occur out of request order. Keep it separate
+            # from the newest request so a failed later search is not mistaken
+            # for proof that previously requested playback never started.
+            self.last_completed_actions[scope] = outcome
+        if not self.process or self.closed or self.closing:
+            return
+
+        async def deliver():
+            async with self.context_lock:
+                if self.closed or self.closing or self.generation != self.bridge._generation:
+                    return
+                latest = self.latest_app_actions[scope]
+                completed = self.last_completed_actions.get(scope)
+                # A late old failure cannot overwrite a newer completed action.
+                if latest is not outcome and result.get("status") != "completed":
+                    return
+                data = {"latest_app_action": latest, "last_completed_app_action": completed}
+                text = ("Silent confirmed app-action outcome update. Order requests within the same scope "
+                        "by request_sequence. A newer completed request supersedes older failed attempts; "
+                        "do not repeat a late failure as current state. last_completed_app_action is an "
+                        "actual outcome, not a new command. Do not speak or delegate merely because this "
+                        "update arrived. Use it to reconcile the corresponding handoff result.\n" +
+                        json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+                # The live side receives the outcome before the backing tool
+                # response can finish its automatic handoff. This is context,
+                # never a new model turn or a forced spoken announcement.
+                await self.rpc("thread/realtime/appendText", {"threadId": self.thread_id,
+                    "role": "developer", "text": text})
+                await self.rpc("thread/inject_items", {"threadId": self.thread_id, "items": [
+                    {"type": "message", "role": "developer", "content": [
+                        {"type": "input_text", "text": text}]}]})
+                self.last_app_state_key = ""
+
+        try:
+            await asyncio.wait_for(deliver(), ACTION_CONTEXT_TIMEOUT_SECONDS)
+        except Exception as error:
+            # A context transport problem must not turn a native success into a
+            # reported failure or block control delivery for another long wait.
+            LOG.warning("voice_app_outcome_context_unavailable thread_id=%s scope=%s error_type=%s",
+                        self.thread_id, scope, type(error).__name__)
 
     async def update_context(self, context, speak=False):
         if self.closed:
@@ -947,6 +1129,9 @@ class _Session:
             # report the application's detailed, user-facing failure.
             compact["music_library"]["error"] = (
                 "The music library reported an error." if state["music_library"].get("error") else None)
+        memory = _Session.compact_player_memory(state.get("player_memory"))
+        if memory is not None:
+            compact["player_memory"] = memory
         return compact
 
     async def read_app_state(self):

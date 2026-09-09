@@ -397,6 +397,45 @@ class VoiceBridgeTests(unittest.TestCase):
             self.assertEqual(executed, [("music_control", {"action": "play", "mix": "jazz"})])
         asyncio.run(scenario())
 
+    def test_personal_memory_is_bounded_and_cannot_override_account_scope(self):
+        for arguments in ({"action": "remember", "key": "interest", "value": "x" * 301},
+                          {"action": "remember", "key": " ", "value": "jazz"},
+                          {"action": "read", "scope": "someone-else"},
+                          {"action": "forget", "key": "interest", "value": "ignored"},
+                          {"action": "forget_all", "query": "ignored"},
+                          {"action": "read", "query": 7}):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(VoiceError):
+                    _app_arguments("player_memory", arguments)
+        self.assertEqual(_app_arguments("player_memory", {"action": "remember", "key": " music ", "value": " jazz "}),
+                         {"action": "remember", "key": "music", "value": "jazz"})
+
+    def test_remember_and_forget_silently_replace_personal_memory_without_coaching_journal_changes(self):
+        async def scenario():
+            returned = iter([
+                {"status": "completed", "player_memory": {"available": True, "memories": [
+                    {"key": "music", "value": "jazz", "updated_at": 123, "path": "/private/memory"}], "count": 1, "truncated": False}},
+                {"status": "completed", "player_memory": {"available": True, "memories": [], "count": 0, "truncated": False}}])
+            executed = []
+            session = _Session(VoiceBridge(action_handler=lambda name, args:
+                executed.append((name, args)) or next(returned)), 0)
+            session.process, session.thread_id = object(), "voice-thread"
+            session.rpc, session.send = AsyncMock(return_value={}), AsyncMock()
+            await session.handle_app_action("remember", tool_request("player_memory", {"action": "remember", "key": "music", "value": "jazz"}, "remember"))
+            text = session.rpc.call_args_list[0].args[1]["text"]
+            value = json.loads(text.split("\n", 1)[1])
+            self.assertEqual(set(value), {"player_memory"}, "The round coaching journal uses a separate memory field")
+            self.assertEqual(value["player_memory"]["memories"][0]["value"], "jazz")
+            self.assertNotIn("/private", text)
+            await session.handle_app_action("forget", tool_request("player_memory", {"action": "forget_all"}, "forget"))
+            latest = json.loads(session.rpc.call_args_list[2].args[1]["text"].split("\n", 1)[1])
+            self.assertEqual(latest["player_memory"]["memories"], [])
+            self.assertEqual(session.latest_app_actions, {}, "Personal memory must not impersonate music or volume actions")
+            self.assertEqual([call.args[0] for call in session.rpc.call_args_list],
+                             ["thread/realtime/appendText", "thread/inject_items"] * 2)
+            self.assertEqual(executed[-1], ("player_memory", {"action": "forget_all"}))
+        asyncio.run(scenario())
+
     def test_mood_request_returns_actual_unchanged_track_without_inventing_a_switch(self):
         async def scenario():
             executed = []
@@ -491,6 +530,8 @@ class VoiceBridgeTests(unittest.TestCase):
             async def send(value):
                 if value.get("id") == "control-request":
                     replied.set()
+                elif value.get("method") in ("thread/realtime/appendText", "thread/inject_items"):
+                    stream.feed_data((json.dumps({"id": value["id"], "result": {}}) + "\n").encode())
 
             session.send = send
             response = asyncio.get_running_loop().create_future()
@@ -605,6 +646,79 @@ class VoiceBridgeTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertIn("error_type=FileNotFoundError", logged.output[0])
             self.assertNotIn("/private", str(logged.output))
+        asyncio.run(scenario())
+
+    def test_new_success_updates_live_context_before_handoff_and_supersedes_cached_failure(self):
+        async def scenario():
+            outcomes = iter([{"status": "failed", "error": "No match", "error_code": "mix_no_match"},
+                {"status": "completed", "track": {"id": "house1", "title": "House fixture", "path": "/private/file"},
+                 "changed_track": True, "confirmed_at_unix_s": time.time()}])
+            session = _Session(VoiceBridge(action_handler=lambda *args: next(outcomes)), 0)
+            session.thread_id = "voice-thread"
+            session.process = object()
+            ordered = []
+            async def rpc(method, params):
+                ordered.append((method, params))
+                return {}
+            async def send(response):
+                ordered.append(("tool_result", response))
+            session.rpc, session.send = rpc, send
+            first = tool_request("music_control", {"action": "play", "mix": "house"}, "first")
+            await session.handle_app_action("failure", first)
+            await session.handle_app_action("success", tool_request("music_control", {"action": "play", "mix": "house"}, "second"))
+            self.assertEqual([method for method, _ in ordered],
+                ["thread/realtime/appendText", "thread/inject_items", "tool_result"] * 2)
+            context = json.loads(ordered[3][1]["text"].split("\n", 1)[1])
+            self.assertEqual(context["latest_app_action"]["status"], "completed")
+            self.assertEqual(context["latest_app_action"]["track"]["title"], "House fixture")
+            self.assertNotIn("/private", ordered[3][1]["text"])
+            before = len(ordered)
+            await session.handle_app_action("redelivered-failure", first)
+            self.assertEqual(len(ordered), before + 1, "Duplicate delivery must not repeat an action or context announcement")
+            stale = json.loads(ordered[-1][1]["result"]["contentItems"][0]["text"])
+            self.assertEqual(stale["superseded_by"]["status"], "completed")
+            self.assertEqual(stale["superseded_by"]["track"]["title"], "House fixture")
+        asyncio.run(scenario())
+
+    def test_late_old_failure_cannot_replace_a_newer_successful_music_outcome(self):
+        async def scenario():
+            release, entered = threading.Event(), threading.Event()
+            def handler(name, args):
+                if args.get("mix") == "old":
+                    entered.set()
+                    release.wait(2)
+                    return {"status": "failed", "error_code": "mix_no_match"}
+                return {"status": "completed", "track": {"id": "new", "title": "New fixture"}}
+            session = _Session(VoiceBridge(action_handler=handler), 0)
+            session.thread_id, session.process = "voice-thread", object()
+            session.rpc, session.send = AsyncMock(return_value={}), AsyncMock()
+            old = asyncio.create_task(session.handle_app_action("old-response", tool_request("music_control", {"action": "play", "mix": "old"}, "old")))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                await session.handle_app_action("new-response", tool_request("music_control", {"action": "play", "mix": "new"}, "new"))
+                release.set()
+                await old
+                self.assertEqual(session.rpc.call_count, 2, "A late failed request must not overwrite newer live context")
+                last = json.loads(session.send.call_args.args[0]["result"]["contentItems"][0]["text"])
+                self.assertEqual(last["superseded_by"]["track"]["id"], "new")
+            finally:
+                release.set()
+        asyncio.run(scenario())
+
+    def test_outcome_context_timeout_preserves_the_completed_native_result(self):
+        async def scenario():
+            session = _Session(VoiceBridge(action_handler=lambda *args: {"status": "completed", "value": 25}), 0)
+            session.process = object()
+            async def stalled_rpc(*args):
+                await asyncio.sleep(60)
+            session.rpc = stalled_rpc
+            started = time.monotonic()
+            with patch("companion.voice_bridge.ACTION_CONTEXT_TIMEOUT_SECONDS", .01), \
+                 self.assertLogs("shadow_aim.voice", level="WARNING") as logged:
+                result = await session.run_app_action("timeout", "set_audio_volume", {"channel": "music", "operation": "set", "value": 25})
+            self.assertEqual(result, {"status": "completed", "value": 25})
+            self.assertLess(time.monotonic() - started, .2)
+            self.assertIn("error_type=TimeoutError", logged.output[-1])
         asyncio.run(scenario())
 
     def test_selected_app_auth_environment_is_used_without_api_keys(self):
@@ -728,7 +842,7 @@ class VoiceBridgeTests(unittest.TestCase):
                 self.assertNotEqual(backing, realtime["initialItems"][0]["text"], "Executor and voice need distinct roles")
                 self.assertIn('"music":80', realtime["initialItems"][1]["text"])
                 self.assertEqual({x["name"] for x in thread["dynamicTools"][0]["tools"]},
-                                 {"get_game_state", "set_audio_volume", "music_control"})
+                                 {"get_game_state", "set_audio_volume", "music_control", "player_memory"})
                 # Follow the handshake with the installed schema's server-request
                 # shape. The real reader must dispatch the registered namespace.
                 feed({"id": "fixture-control", "method": "item/tool/call", "params":

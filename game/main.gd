@@ -612,6 +612,7 @@ func _results(message: String = "") -> void:
 		_render_coach(coach_box)
 	else:
 		var waiting := not job_id.is_empty() or submitting_coach
+		_button(coach_box,"Practice  →",training.start_next,true)
 		job_hint = _paragraph(coach_box,coach_message if not coach_message.is_empty() else (_review_status_text() if waiting else "Your measurements are ready for review."))
 		if waiting:
 			if not job_id.is_empty(): _button(coach_box,"Cancel review",_cancel_coaching)
@@ -643,6 +644,16 @@ func _metric_text(metric: Dictionary) -> String:
 	var value: float = float(metric.get("value",0))
 	var unit: String = str(metric.get("unit",""))
 	return "%0.1f%s" % [value, " " + unit if not unit.is_empty() else ""]
+
+func _practice_while_reviewing(record: Dictionary = {}) -> void:
+	if is_playing or is_replaying: return
+	var source: Dictionary = record if not record.is_empty() else last_record
+	var drill: String = str(source.get("drill",""))
+	if drill not in DRILLS or not source.get("settings") is Dictionary: return
+	guided = false
+	stage = "free"
+	pending_rounds.clear()
+	_begin_round(drill,source.settings.duplicate(true))
 
 func _render_coach(parent: VBoxContainer) -> void:
 	_label(parent,"Juniper has your review.",25)
@@ -799,6 +810,9 @@ func _settings_page() -> void:
 	var audio_card := _card(body)
 	_label(audio_card,"Audio",23)
 	_volume_control(audio_card,["voice","music","game"])
+	var memory_panel := preload("res://game/player_memory_panel.gd").new()
+	body.add_child(memory_panel)
+	memory_panel.setup(self)
 	var grid := GridContainer.new()
 	grid.columns = 2
 	grid.add_theme_constant_override("h_separation",32)
@@ -932,8 +946,7 @@ func _request_coaching(question: String = "") -> void:
 	recommendation.clear()
 	if screen == "results": _results()
 	var response: Dictionary = await _api("/coach",HTTPClient.METHOD_POST,{"record_id":requested_record,"question":question})
-	if generation != review_generation or requested_record != str(last_record.get("id","")):
-		if generation == review_generation: submitting_coach = false
+	if generation != review_generation:
 		if response.has("job_id"): await _api("/jobs/"+str(response.job_id)+"/cancel",HTTPClient.METHOD_POST)
 		return
 	submitting_coach = false
@@ -941,17 +954,16 @@ func _request_coaching(question: String = "") -> void:
 		job_id = str(response.job_id)
 		poll_elapsed = COACH_POLL_SECONDS
 		if screen == "results" and not is_playing and not is_replaying: _results()
-		if voice.is_active and screen == "results" and not is_playing and not is_replaying:
+		if voice.is_active and screen == "results" and not is_playing and not is_replaying and requested_record == str(last_record.get("id","")):
 			_voice_context(true,{"record_id":requested_record,"review_pending_job_id":job_id})
-	elif screen == "results":
+	elif screen == "results" and not is_playing and not is_replaying:
 		coach_message = "Coach unavailable: " + str(response.get("error","Please try again."))
 		_results()
 
 func _review_status_text() -> String:
 	var seconds := maxi(0,int((Time.get_ticks_msec()-review_started_ms)/1000))
-	var text := "Review in progress · %ds · your round is saved" % seconds
-	if seconds >= 30: text += "\nStill reviewing. You can replay or keep practising while it finishes."
-	elif is_instance_valid(voice) and voice.is_active: text += "\nJuniper will speak when the review is ready."
+	var text := "Juniper is reviewing · %ds · your round is saved" % seconds
+	text += "\nYou can keep practising while the review finishes."
 	return text
 
 func _cancel_coaching() -> void:
@@ -993,11 +1005,15 @@ func poll_job() -> void:
 	var status: String = str(response.get("status",""))
 	if status == "complete":
 		job_id = ""
-		if str(last_record.get("id","")) == job_record_id:
+		if not is_playing and not is_replaying and str(last_record.get("id","")) == job_record_id:
 			recommendation = response.get("result",{})
 			recommendation_record_id = job_record_id
-			if screen == "results" and not is_playing and not is_replaying: _results()
 			_voice_context(true,{"coaching":recommendation})
+		# Saved reviews remain available to Practice after the player moves on;
+		# never replace a running drill or its newer approved prescription.
+		if not is_playing and not is_replaying:
+			if screen == "results": _results()
+			elif screen == "home" and is_instance_valid(training): training.refresh()
 	elif status in ["failed","cancelled"] or response.get("error") != null:
 		job_id = ""
 		coach_message = "Coach " + status + ": " + str(response.get("error","Please retry when ready."))

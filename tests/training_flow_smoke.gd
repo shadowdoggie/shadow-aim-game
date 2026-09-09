@@ -73,7 +73,22 @@ func run() -> void:
 	await flow.review_completed_baseline()
 	await process_frame
 	assert(host.reviewed == "measured-weak-baseline" and host.review_requests == 1,"Final baseline must request only the backend-selected measurement review")
+	host.screen = "home"
+	host.step = {"action":"review","baseline_complete":true,"record_id":"unreviewed-free","record":{"id":"unreviewed-free","drill":"tracking","settings":original},"report":{"record_id":"unreviewed-free"}}
+	var before_starts := host.starts.size()
+	await flow.start_next()
+	assert(host.starts.size() == before_starts+1 and host.starts.back().settings == original and host.stage == "free","Practice must start the same settings immediately when the next review is not ready")
+	assert(host.review_requests == 2,"The first background continuation must request its saved review")
+	host.job_id = "pending-review"
+	await flow.start_next()
+	assert(host.starts.size() == before_starts+2 and host.review_requests == 2,"Further practice must not duplicate an existing review")
+	host.step = saved.duplicate(true)
+	host.step.action = "coached_practice"
+	host.step.remaining_rounds = 2
+	await flow.start_next()
+	assert(host.stage == "practice" and host.starts.back().settings == practice and host.source_coaching_record_id == "approved-review","An available approved plan must take precedence over uncoached continuation")
+	assert(host.job_id == "pending-review","Starting an approved plan must not cancel background analysis")
 	host.queue_free()
 	await process_frame
-	print("TRAINING_FLOW_SMOKE_PASS: four distinct baseline modes, partial baseline resume, approved saved practice, exact retest, restart restoration, single selected baseline review")
+	print("TRAINING_FLOW_SMOKE_PASS: four baseline modes, approved saved practice/retest, restart restoration, immediate same-settings continuation, approved plan precedence, no duplicate review")
 	quit()

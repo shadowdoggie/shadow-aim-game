@@ -79,7 +79,7 @@ jobs:
           from pathlib import Path
           scripts = ["arena_smoke", "ui_smoke", "ui_workflows_smoke", "pause_smoke",
                      "sensitivity_result_smoke", "sensitivity_phase_smoke", "account_panel_smoke", "music_ui_smoke", "voice_audio_smoke",
-                     "audio_controls_smoke", "reactive_tracking_smoke", "shot_placement_smoke", "coaching_handoff_smoke", "training_flow_smoke"]
+                     "audio_controls_smoke", "reactive_tracking_smoke", "shot_placement_smoke", "coaching_handoff_smoke", "training_flow_smoke", "player_memory_ui_smoke"]
           # full_loop_smoke deliberately excluded: it performs live subscription inference.
           for script in scripts:
               root = Path(os.environ["AIMCOACH_CI_ROOT"]) / script

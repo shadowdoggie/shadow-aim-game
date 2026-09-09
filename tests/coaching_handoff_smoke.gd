@@ -12,6 +12,7 @@ class ReviewHost:
 	var announcements: Array[Dictionary] = []
 	var replies: Dictionary = {}
 	var delays: Dictionary = {}
+	var started: Array[Dictionary] = []
 
 	func _ready() -> void:
 		pass
@@ -21,6 +22,10 @@ class ReviewHost:
 
 	func _results(_message: String = "") -> void:
 		screen = "results"
+
+	func _begin_round(drill: String, config: Dictionary) -> void:
+		started.append({"drill":drill,"settings":config.duplicate(true)})
+		is_playing = true
 
 	func _voice_context(speak: bool = false, extra: Dictionary = {}) -> void:
 		if speak: announcements.append(extra.duplicate(true))
@@ -49,7 +54,7 @@ func run() -> void:
 	host.voice = FakeVoice.new()
 	host.add_child(host.voice)
 	host.screen = "results"
-	host.last_record = {"id":"round-one","drill":"clicking"}
+	host.last_record = {"id":"round-one","drill":"clicking","settings":host.settings.duplicate(true)}
 	host.last_report = {"record_id":"round-one"}
 	host.replies = {"/coach":{"job_id":"job-one"},"/jobs/job-one":{"status":"pending","error":null}}
 	await host._request_coaching()
@@ -68,10 +73,23 @@ func run() -> void:
 	host.replies["/coach"] = {"job_id":"job-two"}
 	host.delays["/coach"] = 0.04
 	host._request_coaching()
+	host._practice_while_reviewing()
+	if not check(host.started.size() == 1 and host.started[0].settings == host.last_record.settings and host.submitting_coach,"Same-settings practice must start before review submission returns"): return
 	host.last_record.id = "round-three"
 	host.last_report.record_id = "round-three"
 	await create_timer(0.08).timeout
-	if not check(host.job_id.is_empty() and host.announcements.is_empty() and host.calls[-1].path == "/jobs/job-two/cancel","A late job response is cancelled and cannot announce the wrong round"): return
+	if not check(host.job_id == "job-two" and host.announcements.is_empty() and host.calls[-1].path == "/coach","Moving on must preserve a background review without announcing the wrong round"): return
+	var before_calls := host.calls.size()
+	await host._request_coaching()
+	if not check(host.calls.size() == before_calls,"Extra rounds must not submit another review while the first is pending"): return
+	host.recommendation = {"cue":"Newer active prescription"}
+	host.recommendation_record_id = "newer-approved-record"
+	# A running round can still display the reviewed record as last_record.
+	host.last_record.id = host.job_record_id
+	host.replies["/jobs/job-two"] = {"status":"complete","result":{"cue":"Older background result"}}
+	await host.poll_job()
+	if not check(host.job_id.is_empty() and host.recommendation.cue == "Newer active prescription" and host.recommendation_record_id == "newer-approved-record" and host.announcements.is_empty(),"A background result must not overwrite the active newer plan"): return
+	host.is_playing = false
 	host.delays.clear()
 	host.replies["/coach"] = {"job_id":"job-three"}
 	await host._request_coaching()
@@ -87,7 +105,7 @@ func run() -> void:
 	host.replies["/coach"] = {"job_id":"job-four"}
 	await host._request_coaching()
 	if not check(host.announcements.is_empty(),"Reviewing does not activate an opted-out microphone or voice session"): return
-	print("COACHING_HANDOFF_SMOKE_PASS")
+	print("COACHING_HANDOFF_SMOKE_PASS: immediate practice, one persistent background review, no wrong-round speech or active-plan replacement, explicit cancellation")
 	root.remove_child(host)
 	host.queue_free()
 	await process_frame
