@@ -195,6 +195,10 @@ class NativeMusicHTTPTests(unittest.TestCase):
         self.music_state("playing", alpha["id"])
         self.music_action("play", mix="relaxing")
         self.music_state("playing", alpha["id"])
+        # The selected song can remain Alpha while its queue changes. Playback
+        # acknowledgement precedes the next asynchronous metadata publication.
+        self.eventually(lambda: self.server.music_state.get("selection_label") == "Relaxing music"
+                        and self.server.music_state.get("queue_count") == 2)
         self.assertEqual(self.server.music_state["selection_label"], "Relaxing music")
         self.assertEqual(self.server.music_state["queue_count"], 2)
         self.music_action("next")
