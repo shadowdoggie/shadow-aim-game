@@ -145,6 +145,8 @@ func _ready() -> void:
 	pause_menu = PausePanel.new()
 	add_child(pause_menu)
 	pause_menu.setup(self)
+	# Local mixer controls are ready independently of remote coaching startup.
+	_publish_audio_state()
 	_home()
 	_connect_health()
 

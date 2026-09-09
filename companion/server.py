@@ -633,7 +633,10 @@ class CompanionServer(ThreadingHTTPServer):
                     {"drill_id": "switching", "label": "Target switching", "button": button}],
                 "home_buttons": ["Start guided baseline", "Find my sensitivity"],
                 "pause": {"key": "Escape", "buttons": ["Resume round", "End round and return"]},
-                "instruction": "Use these exact visible names when directing the player. Voice cannot activate controls or change settings."}
+                "audio_controls": {"tool": "shadow_aim.set_audio_volume", "channels": ["voice", "music", "game"],
+                                   "operations": ["set", "increase", "decrease"], "unit": "percent"},
+                "music_control": "shadow_aim.music_control",
+                "instruction": "Use these exact visible names when directing the player. Use the registered app tools to change and save audio volumes or control music, and wait for confirmation. The player must activate training buttons and change aim sensitivity themselves."}
 
     @staticmethod
     def _voice_live_measurements(measurements):

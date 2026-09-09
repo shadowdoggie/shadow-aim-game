@@ -44,7 +44,7 @@ class Host:
 		pass
 
 	func _api(path: String, _method: int = HTTPClient.METHOD_GET, payload: Dictionary = {}) -> Dictionary:
-		if path == "/health": return {"status":"ok","connection":"ready"}
+		if path == "/health": return {"status":"ok","connection":"connecting"}
 		if path == "/voice/context" or path == "/music/state": return {"ok":true}
 		if path == "/audio/state":
 			audio_states.append(payload.duplicate(true))
@@ -79,6 +79,8 @@ func run() -> void:
 	root.add_child(host)
 	host.set_process(false)
 	await process_frame
+	assert(not host.audio_states.is_empty(),"Native audio state must be available while remote coaching is still connecting")
+	assert(host.audio_states[0].voice == host.voice_volume * 100.0)
 	assert(not host.voice.is_active and host.voice._microphone == null)
 	var profile := host.settings.duplicate(true)
 	var old_music: Node = host.music

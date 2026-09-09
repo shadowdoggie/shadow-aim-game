@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from companion.voice_bridge import APP_TOOL_NAMESPACE, VoiceBridge, VoiceError, _Session, _app_arguments
+from companion.voice_bridge import APP_TOOL_NAMESPACE, EFFORT, VoiceBridge, VoiceError, _Session, _app_arguments
 
 
 def tool_request(name, arguments, call_id="call-1"):
@@ -370,6 +370,161 @@ class VoiceBridgeTests(unittest.TestCase):
             finally:
                 if session.temp:
                     session.temp.cleanup()
+        asyncio.run(scenario())
+
+    def test_realtime_handshake_preserves_builtin_handoff_and_delivers_app_context(self):
+        async def scenario():
+            executed, sent = [], []
+            session = _Session(VoiceBridge(action_handler=lambda name, args:
+                executed.append((name, args)) or {"status": "completed"}), 0)
+            stream = asyncio.StreamReader()
+
+            class Track:
+                def stop(self):
+                    pass
+
+            class Peer:
+                def addTrack(self, track):
+                    pass
+
+                def createDataChannel(self, name):
+                    return SimpleNamespace(on=lambda event: lambda fn: fn)
+
+                def on(self, event):
+                    return lambda fn: fn
+
+                async def createOffer(self):
+                    return SimpleNamespace(sdp="fixture-offer")
+
+                async def setLocalDescription(self, offer):
+                    self.localDescription = offer
+
+                async def setRemoteDescription(self, answer):
+                    session.media_event({"type": "session.started"})
+
+                async def close(self):
+                    pass
+
+            def feed(message):
+                stream.feed_data((json.dumps(message) + "\n").encode("utf-8"))
+
+            def write(data):
+                message = json.loads(data.decode("utf-8"))
+                sent.append(message)
+                method, params = message.get("method"), message.get("params", {})
+                if "id" not in message or not method:
+                    return
+                result = {}
+                if method == "account/read":
+                    result = {"account": {"type": "chatgpt"}}
+                elif method == "thread/realtime/listVoices":
+                    result = {"voices": {"v1": ["juniper"]}}
+                elif method == "thread/start":
+                    result = {"model": params["model"], "reasoningEffort": EFFORT,
+                              "thread": {"id": "voice-thread"}}
+                elif method == "thread/realtime/start":
+                    feed({"method": "thread/realtime/started", "params": {"version": "v3"}})
+                    feed({"method": "thread/realtime/sdp", "params": {"sdp": "fixture-answer"}})
+                feed({"id": message["id"], "result": result})
+
+            process = SimpleNamespace(stdout=stream, returncode=None,
+                stdin=SimpleNamespace(write=write, drain=AsyncMock()),
+                wait=AsyncMock(return_value=0))
+            process.terminate = lambda: setattr(process, "returncode", 0)
+            media = SimpleNamespace(AudioStreamTrack=Track, RTCPeerConnection=Peer,
+                                    RTCSessionDescription=lambda *args, **kwargs: kwargs)
+            scoring_command = ["fixture-codex", "app-server", "-c", "features.code_mode=false",
+                "-c", "features.code_mode_host=false", "-c", "features.shell_tool=false",
+                "-c", 'developer_instructions="scoring-only fixture"']
+            launch = AsyncMock(return_value=process)
+            try:
+                with patch("companion.voice_bridge._load_media", return_value=(media, object())), \
+                     patch("companion.voice_bridge._command", return_value=scoring_command), \
+                     patch("companion.voice_bridge.asyncio.create_subprocess_exec", launch):
+                    await session.connect({"playing": False, "audio": {"music": 80}})
+                thread = next(x["params"] for x in sent if x.get("method") == "thread/start")
+                realtime = next(x["params"] for x in sent if x.get("method") == "thread/realtime/start")
+                arguments = list(launch.call_args.args)
+                overrides = dict(arguments[i + 1].split("=", 1)
+                                 for i, value in enumerate(arguments[:-1]) if value == "-c")
+                self.assertEqual(overrides["features.code_mode_host"], "true")
+                self.assertEqual(overrides["features.code_mode"], "true")
+                self.assertEqual(overrides["features.shell_tool"], "false", "The wrapper must not enable shell access")
+                backing = json.loads(overrides["developer_instructions"])
+                self.assertEqual(thread["baseInstructions"], backing)
+                self.assertTrue(thread["developerInstructions"].startswith(backing))
+                self.assertNotIn("scoring-only fixture", backing)
+                self.assertIn("Do not create or delegate to another agent", backing)
+                self.assertIn("functions.exec", backing)
+                self.assertNotIn("prompt", realtime, "Replacing Codex's prompt discards its handoff guidance")
+                self.assertFalse(realtime.get("clientManagedHandoffs", False), "Codex must own automatic handoffs")
+                self.assertEqual((realtime["version"], realtime["voice"]), ("v3", "juniper"))
+                self.assertEqual([x["role"] for x in realtime["initialItems"]], ["developer", "developer"])
+                self.assertIn("built-in background-agent handoff", realtime["initialItems"][0]["text"])
+                self.assertNotEqual(backing, realtime["initialItems"][0]["text"], "Executor and voice need distinct roles")
+                self.assertIn('"music":80', realtime["initialItems"][1]["text"])
+                self.assertEqual({x["name"] for x in thread["dynamicTools"][0]["tools"]},
+                                 {"get_game_state", "set_audio_volume", "music_control"})
+                # Follow the handshake with the installed schema's server-request
+                # shape. The real reader must dispatch the registered namespace.
+                feed({"id": "fixture-control", "method": "item/tool/call", "params":
+                    tool_request("set_audio_volume", {"channel": "music", "operation": "set", "value": 40})})
+                for _ in range(100):
+                    if any(x.get("id") == "fixture-control" for x in sent):
+                        break
+                    await asyncio.sleep(.001)
+                reply = next(x for x in sent if x.get("id") == "fixture-control")
+                self.assertTrue(reply["result"]["success"])
+                self.assertEqual(executed, [("set_audio_volume", {"channel": "music", "operation": "set", "value": 40})])
+            finally:
+                await session.close()
+        asyncio.run(scenario())
+
+    def test_backing_protocol_failure_logs_metadata_and_redacts_credentials(self):
+        async def scenario():
+            session = _Session(VoiceBridge(), 0)
+            session.thread_id = "voice-thread"
+            stream = asyncio.StreamReader()
+            session.process = SimpleNamespace(stdout=stream)
+            session.send = AsyncMock()
+            barrier = asyncio.get_running_loop().create_future()
+            session.pending[900] = barrier
+            with self.assertLogs("shadow_aim.voice", level="INFO") as captured:
+                reader = asyncio.create_task(session.read())
+                for event in [
+                    {"method": "turn/started", "params": {"turn": {"id": "turn-1", "status": "inProgress"}}},
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "failed",
+                        "error": {"message": "Bridge failed with Bearer fixture-secret"}}}},
+                    {"id": "unsupported", "method": "item/unknown/call", "params": {"private": "do not log me"}},
+                    {"id": 900, "result": {}},
+                ]:
+                    stream.feed_data((json.dumps(event) + "\n").encode("utf-8"))
+                await asyncio.wait_for(barrier, 1)
+                session.closed = True
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+            logs = "\n".join(captured.output)
+            self.assertIn("voice_backing_turn_failed", logs)
+            self.assertIn("voice_server_request_rejected", logs)
+            self.assertIn("turn_id=turn-1", logs)
+            self.assertNotIn("fixture-secret", logs)
+            self.assertNotIn("do not log me", logs)
+        asyncio.run(scenario())
+
+    def test_rejected_control_request_is_logged_without_private_arguments(self):
+        async def scenario():
+            session = _Session(VoiceBridge(), 0)
+            session.thread_id = "voice-thread"
+            session.send = AsyncMock()
+            request = {**tool_request("music_control", {"action": "play", "query": "private song query"}),
+                       "namespace": "wrong"}
+            with self.assertLogs("shadow_aim.voice", level="INFO") as captured:
+                await session.handle_app_action("fixture-rejected", request)
+            logs = "\n".join(captured.output)
+            self.assertIn("voice_app_request_rejected", logs)
+            self.assertIn("namespace_match=False", logs)
+            self.assertNotIn("private song query", logs)
+            self.assertFalse(session.send.call_args.args[0]["result"]["success"])
         asyncio.run(scenario())
 
     def test_windows_native_and_npm_launch_prefixes_remain_argv_without_a_shell(self):
